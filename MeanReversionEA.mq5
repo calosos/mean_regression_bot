@@ -35,6 +35,25 @@ ulong position_ids[];
 string signal_key="";
 string exit_reason="";
 double realized=0;
+struct ExcursionStats
+{
+   long e1_msc;
+   double mfe;
+   double mae;
+   datetime mfe_at;
+   datetime mae_at;
+   double risk_budget;
+};
+ExcursionStats g_excursions;
+struct DiagnosticPosition
+{
+   ulong ticket;
+   ulong id;
+   double volume;
+   double profit;
+   double swap;
+   long updated_msc;
+};
 // Reporting outlives the operational idea/cooldown: never reuse current idea
 // globals to finish a previous idea's accounting after delayed history events.
 struct ExitReport
@@ -47,6 +66,9 @@ struct ExitReport
    bool warned;
    string reason;
    ulong ids[];
+   ExcursionStats excursions;
+   long first_execution_msc;
+   long last_exit_msc;
 };
 ExitReport g_exit_reports[];
 // Uncertain requests remain locked until server confirmation or disappearance
@@ -312,6 +334,7 @@ void CloseStep()
    {
       InspectIdeaHistory();
       if(manual_required || !history_ok) return;
+      ObserveIdeaExcursions();
       QueueExitReport();
       FlushExitReports();
       if(had_exposure) Cooldown(TimeCurrent());
@@ -532,6 +555,7 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
    if(manual_required || !history_ok || ForeignExposure() || OwnPositions()>0 || OwnOrders()>0) return;
    idea_start=TimeCurrent(); realized=0; entries=0; e1_order=0; e2_order=0; had_exposure=false;
    ArrayResize(position_ids,0);
+   ResetExcursions();
    target=Target(mid,upper,lower); tp_bar=iTime(_Symbol,PERIOD_M5,0);
    state=ACTIVE_IDEA;
    // FOK when available; otherwise IOC, with partial execution handled by abort.
@@ -541,6 +565,7 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
    bool sent=side>0 ? trade.Buy(lot,_Symbol,0,0,0,"MR E1") : trade.Sell(lot,_Symbol,0,0,0,"MR E1");
    uint code=trade.ResultRetcode(); e1_order=trade.ResultOrder();
+   ObserveIdeaExcursions();
    if(Uncertain(code)) { LockResult(e1_order,false,true); Abort("E1 incierta"); return; }
    if(!sent || code!=TRADE_RETCODE_DONE)
    { Abort(code==TRADE_RETCODE_DONE_PARTIAL ? "E1 parcial" : "E1 rechazada"); return; }
@@ -574,6 +599,7 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
    trade.SetTypeFilling(ORDER_FILLING_RETURN);
    sent=direction>0 ? trade.BuyLimit(lot,e2,_Symbol,g_sl,tp,ORDER_TIME_GTC,0,"MR E2") : trade.SellLimit(lot,e2,_Symbol,g_sl,tp,ORDER_TIME_GTC,0,"MR E2");
    code=trade.ResultRetcode(); e2_order=trade.ResultOrder();
+   ObserveIdeaExcursions();
    if(Uncertain(code) && code!=TRADE_RETCODE_PLACED) { LockResult(e2_order,true,true); Abort("E2 incierta"); return; }
    if(!sent || (code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_PLACED))
    { Abort("Colocacion E2 fallida"); return; }
@@ -673,6 +699,9 @@ void QueueExitReport()
    g_exit_reports[n].exposed=had_exposure;
    g_exit_reports[n].warned=false;
    g_exit_reports[n].reason=exit_reason;
+   g_exit_reports[n].excursions=g_excursions;
+   g_exit_reports[n].first_execution_msc=0;
+   g_exit_reports[n].last_exit_msc=0;
    ArrayResize(g_exit_reports[n].ids,ArraySize(position_ids));
    ArrayCopy(g_exit_reports[n].ids,position_ids);
 }
@@ -693,15 +722,28 @@ bool ReportOrderVolume(ExitReport &report,const ulong order,double &executed)
    if(executed>0) ReportAddId(report,(ulong)HistoryOrderGetInteger(order,ORDER_POSITION_ID));
    return true;
 }
-bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
+bool DiagnosticOrderVolume(ExitReport &report,const ulong order,const bool final_sample,double &executed)
+{
+   if(!final_sample && order!=0 && OrderSelect(order))
+   {
+      if(OrderGetString(ORDER_SYMBOL)!=_Symbol || (ulong)OrderGetInteger(ORDER_MAGIC)!=InpMagicNumber) return false;
+      executed=OrderGetDouble(ORDER_VOLUME_INITIAL)-OrderGetDouble(ORDER_VOLUME_CURRENT);
+      if(executed<0) return false;
+      if(executed>0) ReportAddId(report,(ulong)OrderGetInteger(ORDER_POSITION_ID));
+      return true;
+   }
+   return ReportOrderVolume(report,order,executed);
+}
+bool ReconcileIdeaPnl(ExitReport &report,const bool final_sample,double &pnl,int &entry_count)
 {
    pnl=0; entry_count=0;
    double expected_first=0,expected_second=0;
-   if(!ReportOrderVolume(report,report.first_order,expected_first) ||
-      !ReportOrderVolume(report,report.second_order,expected_second)) return false;
-   // Full position lifetime is needed for restart cleanup too. Selection is
-   // inclusive of the whole current second; no cursor based on DEAL_TIME.
-   if(!HistorySelect(0,TimeCurrent())) return false;
+   if(!DiagnosticOrderVolume(report,report.first_order,final_sample,expected_first) ||
+      !DiagnosticOrderVolume(report,report.second_order,final_sample,expected_second)) return false;
+   // Normal ideas need only their lifetime; startup cleanup without an E1
+   // order needs older history too. Include the whole current second, no cursor.
+   datetime from=report.first_order!=0 ? report.idea_id : 0;
+   if(!HistorySelect(from,TimeCurrent())) return false;
    for(int i=0;i<HistoryDealsTotal();i++)
    {
       ulong d=HistoryDealGetTicket(i);
@@ -710,6 +752,29 @@ bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
       if((report.first_order!=0 && order==report.first_order) || (report.second_order!=0 && order==report.second_order))
          ReportAddId(report,(ulong)HistoryDealGetInteger(d,DEAL_POSITION_ID));
    }
+   DiagnosticPosition live[];
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0 || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      if(!ReportHasId(report,id))
+      {
+         // An entry whose history/identity has not arrived yet is not zero PnL.
+         if(!final_sample && (ulong)PositionGetInteger(POSITION_MAGIC)==InpMagicNumber) return false;
+         continue;
+      }
+      if(final_sample || (ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber) return false;
+      int n=ArraySize(live); ArrayResize(live,n+1);
+      live[n].ticket=ticket; live[n].id=id;
+      live[n].volume=PositionGetDouble(POSITION_VOLUME);
+      live[n].profit=PositionGetDouble(POSITION_PROFIT);
+      live[n].swap=PositionGetDouble(POSITION_SWAP);
+      live[n].updated_msc=PositionGetInteger(POSITION_TIME_UPDATE_MSC);
+   }
+   long first_msc=0,last_exit_msc=0;
+   long latest_deal_msc[];
+   ArrayResize(latest_deal_msc,ArraySize(report.ids)); ArrayInitialize(latest_deal_msc,0);
    double incoming[],outgoing[];
    ArrayResize(incoming,ArraySize(report.ids)); ArrayInitialize(incoming,0);
    ArrayResize(outgoing,ArraySize(report.ids)); ArrayInitialize(outgoing,0);
@@ -735,8 +800,13 @@ bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
          if(entry==DEAL_ENTRY_IN) incoming[j]+=volume;
          else if(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY) outgoing[j]+=volume;
       }
+      long stamp=HistoryDealGetInteger(d,DEAL_TIME_MSC);
+      if(stamp<=0) return false;
+      for(int j=0;j<ArraySize(report.ids);j++)
+         if(report.ids[j]==id && stamp>latest_deal_msc[j]) latest_deal_msc[j]=stamp;
       if(entry==DEAL_ENTRY_IN)
       {
+         if(first_msc==0 || stamp<first_msc) first_msc=stamp;
          if((ulong)HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagicNumber) return false;
          if(order==report.first_order) first_volume+=volume;
          if(order==report.second_order) second_volume+=volume;
@@ -744,6 +814,7 @@ bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
          for(int j=0;j<ArraySize(entry_orders);j++) if(entry_orders[j]==order) { seen=true; break; }
          if(!seen) { int n=ArraySize(entry_orders); ArrayResize(entry_orders,n+1); entry_orders[n]=order; }
       }
+      if((entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY) && stamp>last_exit_msc) last_exit_msc=stamp;
       pnl+=HistoryDealGetDouble(d,DEAL_PROFIT)+HistoryDealGetDouble(d,DEAL_SWAP)+
            HistoryDealGetDouble(d,DEAL_COMMISSION)+HistoryDealGetDouble(d,DEAL_FEE);
    }
@@ -751,10 +822,98 @@ bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
    if(MathAbs(first_volume-expected_first)>tolerance || MathAbs(second_volume-expected_second)>tolerance) return false;
    if(report.exposed && ArraySize(report.ids)==0) return false;
    for(int i=0;i<ArraySize(report.ids);i++)
-      if(incoming[i]<=0 || MathAbs(incoming[i]-outgoing[i])>tolerance) return false;
+   {
+      double open_volume=0;
+      for(int j=0;j<ArraySize(live);j++) if(live[j].id==report.ids[i]) open_volume+=live[j].volume;
+      if(incoming[i]<=0 || MathAbs(incoming[i]-outgoing[i]-open_volume)>tolerance) return false;
+   }
+   // Re-read the portfolio after history: a partial/full close or E2 fill in
+   // between must invalidate the sample, not duplicate realized + stale float.
+   for(int j=0;j<ArraySize(live);j++)
+   {
+      // Offset fills/closes can leave netting volume unchanged. The latest
+      // volume-update time must still be represented in the selected history.
+      for(int k=0;k<ArraySize(report.ids);k++)
+         if(report.ids[k]==live[j].id && live[j].updated_msc>latest_deal_msc[k]) return false;
+      if(!PositionSelectByTicket(live[j].ticket) || PositionGetString(POSITION_SYMBOL)!=_Symbol ||
+         (ulong)PositionGetInteger(POSITION_IDENTIFIER)!=live[j].id ||
+         (ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber ||
+         PositionGetInteger(POSITION_TIME_UPDATE_MSC)!=live[j].updated_msc ||
+         MathAbs(PositionGetDouble(POSITION_VOLUME)-live[j].volume)>tolerance ||
+         PositionGetDouble(POSITION_SWAP)!=live[j].swap || PositionGetDouble(POSITION_PROFIT)!=live[j].profit) return false;
+      pnl+=live[j].profit+live[j].swap;
+   }
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0 || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      if(!ReportHasId(report,id))
+      {
+         if(!final_sample && (ulong)PositionGetInteger(POSITION_MAGIC)==InpMagicNumber) return false;
+         continue;
+      }
+      bool found=false;
+      for(int j=0;j<ArraySize(live);j++) if(live[j].ticket==ticket) { found=true; break; }
+      if(!found) return false;
+   }
+   if(!MathIsValidNumber(pnl)) return false;
+   report.first_execution_msc=first_msc;
+   report.last_exit_msc=last_exit_msc;
    entry_count=ArraySize(entry_orders);
    return !report.exposed || entry_count>0;
 }
+bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
+{
+   return ReconcileIdeaPnl(report,true,pnl,entry_count);
+}
+void ResetExcursions()
+{
+   g_excursions.e1_msc=0;
+   g_excursions.mfe=0; g_excursions.mae=0;
+   g_excursions.mfe_at=0; g_excursions.mae_at=0;
+   g_excursions.risk_budget=Budget();
+}
+void UpdateExcursions(ExcursionStats &stats,const double pnl,const long first_msc,const datetime observed_at)
+{
+   if(first_msc<=0 || !MathIsValidNumber(pnl)) return;
+   if(stats.e1_msc==0)
+   {
+      stats.e1_msc=first_msc;
+      stats.mfe=0; stats.mae=0;
+      stats.mfe_at=(datetime)(first_msc/1000); stats.mae_at=stats.mfe_at;
+      if(stats.risk_budget<=0) stats.risk_budget=Budget();
+   }
+   if(pnl>stats.mfe) { stats.mfe=pnl; stats.mfe_at=observed_at; }
+   if(pnl<stats.mae) { stats.mae=pnl; stats.mae_at=observed_at; }
+}
+void ObserveIdeaExcursions()
+{
+   if(idea_start==0 || (state!=ACTIVE_IDEA && state!=CLOSING_IDEA)) return;
+   ExitReport sample;
+   sample.idea_id=idea_start;
+   sample.first_order=e1_order; sample.second_order=e2_order;
+   sample.exposed=true;
+   ArrayCopy(sample.ids,position_ids);
+   double pnl=0; int count=0;
+   // Deliberately independent of history_ok and all operational decisions.
+   if(ReconcileIdeaPnl(sample,false,pnl,count))
+      UpdateExcursions(g_excursions,pnl,sample.first_execution_msc,TimeCurrent());
+}
+string ExitDiagnosticText(const ExitReport &report)
+{
+   bool available=report.excursions.e1_msc>0;
+   double risk=report.excursions.risk_budget;
+   if(risk<=0) risk=Budget();
+   double duration=available && report.last_exit_msc>=report.excursions.e1_msc ?
+                   (double)(report.last_exit_msc-report.excursions.e1_msc)/1000.0 : 0;
+   return StringFormat("MFE_MAE_disponible=%s MFE_USD=%.2f MAE_USD=%.2f MFE_fecha=%s MAE_fecha=%s riesgo_presupuestado_USD=%.2f MFE_R=%.6f MAE_R=%.6f duracion_segundos=%.3f",
+          available ? "true" : "false",report.excursions.mfe,report.excursions.mae,
+          available ? TimeToString(report.excursions.mfe_at,TIME_DATE|TIME_SECONDS) : "n/a",
+          available ? TimeToString(report.excursions.mae_at,TIME_DATE|TIME_SECONDS) : "n/a",
+          risk,risk>0 ? report.excursions.mfe/risk : 0,risk>0 ? report.excursions.mae/risk : 0,duration);
+}
+
 void RemoveExitReport(const int index)
 {
    // Copy fields explicitly because snapshots own independent dynamic ID arrays.
@@ -767,6 +926,9 @@ void RemoveExitReport(const int index)
       g_exit_reports[j].exposed=g_exit_reports[j+1].exposed;
       g_exit_reports[j].warned=g_exit_reports[j+1].warned;
       g_exit_reports[j].reason=g_exit_reports[j+1].reason;
+      g_exit_reports[j].excursions=g_exit_reports[j+1].excursions;
+      g_exit_reports[j].first_execution_msc=g_exit_reports[j+1].first_execution_msc;
+      g_exit_reports[j].last_exit_msc=g_exit_reports[j+1].last_exit_msc;
       ArrayResize(g_exit_reports[j].ids,ArraySize(g_exit_reports[j+1].ids));
       ArrayCopy(g_exit_reports[j].ids,g_exit_reports[j+1].ids);
    }
@@ -779,9 +941,13 @@ void FlushExitReports()
       double pnl=0; int count=0;
       if(ReconcileExitReport(g_exit_reports[i],pnl,count))
       {
-         PrintFormat("EXIT %s idea=%I64d cierre=%s motivo=%s PnL_realizado=%.2f entradas=%d",
+         // Final realized PnL is itself an observation, even if exit deals
+         // arrived after cooldown or after the next idea started.
+         UpdateExcursions(g_exit_reports[i].excursions,pnl,g_exit_reports[i].first_execution_msc,
+                          (datetime)(g_exit_reports[i].last_exit_msc/1000));
+         PrintFormat("EXIT %s idea=%I64d cierre=%s motivo=%s PnL_realizado=%.2f entradas=%d %s",
                      TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),(long)g_exit_reports[i].idea_id,
-                     TimeToString(g_exit_reports[i].closed_at,TIME_DATE|TIME_SECONDS),g_exit_reports[i].reason,pnl,count);
+                     TimeToString(g_exit_reports[i].closed_at,TIME_DATE|TIME_SECONDS),g_exit_reports[i].reason,pnl,count,ExitDiagnosticText(g_exit_reports[i]));
          RemoveExitReport(i);
       }
       else if(!g_exit_reports[i].warned)
@@ -905,9 +1071,11 @@ void OnTick()
    {
       idea_start=TimeCurrent(); had_exposure=true;
       e1_order=0; e2_order=0; ArrayResize(position_ids,0); TrackCurrent();
+      ResetExcursions();
       BeginClose("Exposicion propia tardia fuera de una idea activa");
    }
    if(state==ACTIVE_IDEA || state==CLOSING_IDEA) InspectIdeaHistory();
+   ObserveIdeaExcursions();
    if(manual_required) { CloseStep(); return; }
    if(state==CLOSING_IDEA) { CloseStep(); return; }
    if(!history_ok) return;
@@ -1001,6 +1169,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
    }
    ReconcilePending();
    if(state==ACTIVE_IDEA || state==CLOSING_IDEA) InspectIdeaHistory();
+   ObserveIdeaExcursions();
    FlushExitReports();
    // Execute reconciled actions on the next tick, not recursively in this handler.
 }

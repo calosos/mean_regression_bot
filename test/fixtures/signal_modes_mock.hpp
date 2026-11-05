@@ -48,3 +48,6 @@ int CopyRates(const string&,int,int shift,int,MqlRates (&out)[1]){rate_reads.pus
 bool SaveSignal(){return true;}
 void SignalLog(int,const MqlRates&,double,double,double,double,double){signal_logs++;}
 void OpenIdea(int side,double atr,double mid,double upper,double lower){opens.push_back({now,atr,mid,upper,lower,side});if(accept_open)state=ACTIVE_IDEA;}
+
+void ObserveIdeaExcursions() {}
+void ResetExcursions() {}

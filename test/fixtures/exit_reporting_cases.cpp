@@ -9,6 +9,7 @@ void reset() {
  now=1790566265; idea_start=1790566264; e1_order=100;e2_order=101;had_exposure=true;state=ACTIVE_IDEA;
  netting=false;history_ok=true;history_available=true;entries=0;realized=0;
  position_ids.clear();g_exit_reports.clear();logs.clear();deals.clear();orders.clear();
+ ResetExcursions();
  orders[100]=Order{.03,0,200};orders[101]=Order{.03,0,201};
 }
 int main() {

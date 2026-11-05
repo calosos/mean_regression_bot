@@ -68,7 +68,7 @@ def declaration(text, name):
 
 def cpp_arrays(text):
     """Adapt MQL dynamic-array declarations to std::vector without altering logic."""
-    pattern = r"\b(ulong|double|ExitReport|ManagementRetry)\s+(\w+\[\](?:\s*,\s*\w+\[\])*)"
+    pattern = r"\b(ulong|long|double|ExitReport|ManagementRetry|DiagnosticPosition)\s+(\w+\[\](?:\s*,\s*\w+\[\])*)"
     return re.sub(pattern, lambda match: f"std::vector<{match[1]}> {match[2].replace('[]', '')}", text)
 
 
@@ -95,7 +95,7 @@ def execute_cpp(program):
         binary = Path(directory) / "scenario"
         cpp.write_text(program, encoding="utf-8")
         command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                   "-Wno-misleading-indentation", str(cpp), "-o", str(binary)]
+                   "-Wno-misleading-indentation", "-I", str(FIXTURES), str(cpp), "-o", str(binary)]
         result = subprocess.run(command, capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise AssertionError(f"Auxiliary C++ compilation failed (not MetaEditor):\n{result.stdout}{result.stderr}")

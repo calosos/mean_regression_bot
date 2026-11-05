@@ -94,3 +94,6 @@ double StopDistance() { return .01; }
 double PositionGetDouble(int field) { return field==POSITION_SL ? g_sl : 0; }
 double OrderGetDouble(int field) { return field==ORDER_PRICE_OPEN ? 2498 : 0; }
 void BeginClose(const string&) { state=CLOSING_IDEA; }
+
+void ObserveIdeaExcursions() {}
+void ResetExcursions() {}

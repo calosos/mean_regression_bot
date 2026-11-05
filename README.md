@@ -189,6 +189,47 @@ Se usan únicamente las identidades del símbolo/Magic del EA. Un resumen de una
 
 **Final del periodo del Probador:** el Probador puede liquidar posiciones al terminar el intervalo sin que el EA reciba otra oportunidad de ejecutar su ciclo normal de cierre y generar el resumen `EXIT` habitual. Esa liquidación puede aparecer en el informe/historial de MT5 sin una línea `EXIT` del EA. `OnDeinit` solo intenta completar resúmenes que ya estaban en cola y libera indicadores; no fuerza operaciones ni fabrica un cierre de estrategia. Al comparar resultados hay que revisar también las liquidaciones del final del test y los posibles `EXIT_PENDING`, además de los resúmenes del Diario.
 
+### MFE y MAE monetarios por idea (solo diagnóstico)
+
+En cada tick con una idea activa o en cierre y después de reconciliar transacciones se intenta obtener una muestra coherente del resultado conjunto:
+
+`PnL_idea = realizado_acumulado + flotante_actual_de_las_posiciones_de_la_idea`
+
+- El realizado suma `DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION + DEAL_FEE` de los deals de compra/venta vinculados a los identificadores de posición y órdenes de la idea. Mantiene el criterio del `PnL_realizado` de `EXIT`: incluye los costes ya registrados en esos deals, sin estimar comisiones futuras ni agregar cargos históricos independientes del tipo balance/comisión.
+- El flotante suma `POSITION_PROFIT + POSITION_SWAP` de las posiciones abiertas de esa idea. Las pendientes, incluido E2 antes de ejecutarse, aportan cero exposición. El swap de un volumen ya cerrado pertenece a sus deals; el swap restante pertenece a las posiciones abiertas. No se suma además otro total de swap histórico.
+- El disparador operativo de cierre monetario **no cambia**: sigue usando únicamente el flotante conjunto con swap, sin añadir realizado ni comisiones históricas. MFE/MAE no activan cierres ni modifican señales, entradas, volumen, SL, TP, reintentos o enfriamiento.
+
+Desde la primera ejecución confirmada de E1, los extremos parten de cero: `MFE_USD=max(0, muestras)` y `MAE_USD=min(0, muestras)`. Se conservan al ejecutar E2 y se calculan a partir del resultado conjunto en cada instante; no se suman máximos o mínimos individuales de las entradas. La fecha inicial de ambos extremos es la de la primera ejecución de E1. Solo una mejora estricta cambia la fecha de un extremo; los empates conservan su primera fecha. Las fechas de muestras en curso son las de observación del tick/transacción. Si el resultado final reconciliado fija un extremo que todavía no se había observado, se usa la fecha efectiva del último deal de salida; si ya se había observado ese mismo extremo, se conserva su primera fecha.
+
+**Reconciliación:** antes de actualizar los extremos se comprueba que el volumen ejecutado de las órdenes conocidas esté reflejado en los deals y que, por posición, `entradas - salidas = volumen_abierto`. Se comprueba también que la última actualización de volumen de cada posición esté representada en el historial y se vuelve a leer el portfolio para detectar desapariciones, cambios de volumen/identidad/versión, beneficio o swap durante la lectura. Esto evita sumar un cierre realizado con el flotante anterior de la misma exposición. En netting se comprueba el volumen consolidado; no se infieren dos posiciones por tener dos entradas. No se atribuye a la idea el resultado de posiciones netting mezcladas.
+
+Si faltan datos o la fotografía no es coherente, se conservan los extremos anteriores y se vuelve a intentar en eventos posteriores. No se usa un resultado parcial como cero, no se acumulan dos veces los mismos deals y no se combinan retrospectivamente flotantes antiguos con resultados realizados nuevos. Una muestra que no puede reconciliarse no aporta un extremo estimado. El código de diagnóstico solo lee datos y actualiza sus propios registros; no cambia `history_ok` ni los estados operativos.
+
+Cuando la idea queda sin exposición se copia también su estado MFE/MAE al resumen independiente en cola. El PnL realizado final se incorpora como una última muestra **antes de publicar `EXIT`**, por lo que puede fijar un nuevo MAE o MFE. La identidad, los extremos y el presupuesto de ese resumen no se sustituyen cuando comienza otra idea. El enfriamiento comienza en el mismo punto operativo de antes y no espera a que el resultado contable esté disponible.
+
+El `EXIT` definitivo conserva sus campos anteriores y añade:
+
+```text
+MFE_MAE_disponible=<true|false>
+MFE_USD=<maximo_no_negativo> MAE_USD=<minimo_no_positivo>
+MFE_fecha=<fecha_hora> MAE_fecha=<fecha_hora>
+riesgo_presupuestado_USD=<presupuesto_congelado_de_la_idea>
+MFE_R=<MFE_USD/presupuesto> MAE_R=<MAE_USD/presupuesto>
+duracion_segundos=<ultimo_deal_salida_msc-momento_E1_msc, dividido por 1000>
+```
+
+Se publica en la misma línea de `EXIT`, no una línea por tick. El presupuesto se congela con los parámetros de la idea antes del envío de E1; por ejemplo, USD 25,000 al 0.25% dan USD 62.50. `MAE_R` conserva el signo negativo. La duración usa las ejecuciones reales en milisegundos y se muestra en segundos con tres decimales: no incluye esperas posteriores por cancelaciones pendientes o por publicación del resumen. Si E1 fue rechazada y no hubo ejecución, se indica `MFE_MAE_disponible=false`, extremos/R/duración cero y fechas `n/a`; no representa una operación de equilibrio.
+
+**Límites:** son extremos observados en las muestras coherentes de los eventos procesados por el EA. No garantizan capturar toda variación del mercado, el máximo/mínimo entre ticks, eventos no recibidos o muestras cuyo historial todavía era incompleto. El estado vive en memoria: una reinicialización no reconstruye las excursiones anteriores. Durante la limpieza de residuos al iniciar se pueden obtener la hora original de E1 y el resultado desde el historial, pero solo se observan excursiones desde esta instancia y se utiliza su presupuesto configurado; no debe interpretarse como recuperación de todo el recorrido previo ni de un presupuesto histórico desconocido.
+
+El Probador puede liquidar posiciones al terminar el periodo sin dar al EA otra oportunidad de reconciliar y publicar su `EXIT` habitual. En ese caso tampoco se garantiza el resumen final MFE/MAE: revisar el informe/historial del Probador y los `EXIT_PENDING`. `OnDeinit` solo intenta completar resúmenes ya en cola; no fuerza operaciones ni inventa extremos retrospectivos.
+
+**Verificación de este cambio:**
+
+- Ejecutadas las pruebas de `test/`, incluida la nueva regresión de excursiones: MFE=0 en ideas siempre perdedoras; rebote positivo conservado con cierre negativo; E2 sin reinicio; medición conjunta frente a máximos individuales; cierres parciales y 24 permutaciones de cierres simultáneos; realizado final que establece un nuevo MAE; comisiones, fee/swap sin duplicación; datos incompletos y cambios de posiciones durante la lectura; presupuesto/R, fechas, duración y resumen atrasado después de iniciar otra idea. También se comprobó netting con entradas consolidadas y cambios de volumen compensados con historial atrasado.
+- Revisión estática por comparación con la versión anterior: señales, riesgo, niveles, TP, enfriamiento, reintentos, protección de propiedad e inicialización conservados. El flujo de `OnTick`, `OpenIdea`, `CloseStep` y `OnTradeTransaction` es idéntico al retirar las llamadas de diagnóstico. Un contrato estático de la suite prohíbe solicitudes de trading, cambios de estado operativo y logs por tick desde las funciones nuevas de medición.
+- La suite completa pasa **14 tests** (6 de comportamiento con múltiples escenarios, 4 del arnés y 4 contratos estáticos). Los tests de comportamiento compilan fragmentos actuales con C++ y adaptadores MT5: no son compilación MQL5 ni backtesting real. El intento de invocar MetaEditor volvió a fallar con `WSL ... UtilBindVsockAnyPort ... socket failed 1`. Quedan pendientes compilar esta versión en MetaEditor y comparar su operativa con la anterior en el Probador.
+
 ## Ejemplo de riesgo
 
 Con referencia de USD 25,000, el 0.25% equivale a USD 62.50. Para un contrato de 100 onzas/lote y ATR = 2:
@@ -229,7 +270,7 @@ No hay dependencias Python que instalar ni se necesita un entorno virtual. Para 
 uv run --no-project --no-managed-python --offline python3 -m unittest discover -s test -t . -v
 ```
 
-La suite usa `unittest`: 5 tests de comportamiento con múltiples escenarios internos, 4 comprobaciones del extractor/adaptador y 3 contratos estáticos. Cubre riesgo/lotaje, señales y modos, TP, enfriamiento, reintentos, identidad/PnL de cierres y trazabilidad tras pausas. Extrae funciones del fuente actual y usa respuestas MT5 simuladas; no depende de snapshots o scripts temporales anteriores. Sin compilador C++17, los tests de comportamiento se marcan como omitidos, no como verificados.
+La suite usa `unittest`: 6 tests de comportamiento con múltiples escenarios internos, 4 comprobaciones del extractor/adaptador y 4 contratos estáticos. Cubre riesgo/lotaje, señales y modos, TP, enfriamiento, reintentos, identidad/PnL de cierres, MFE/MAE conjuntos y trazabilidad tras pausas. Extrae funciones del fuente actual y usa respuestas MT5 simuladas; no depende de snapshots o scripts temporales anteriores. Sin compilador C++17, los tests de comportamiento se marcan como omitidos, no como verificados.
 
 Los detalles y límites están en [`test/README.md`](test/README.md). Estas pruebas no sustituyen compilación MQL5 ni backtesting MT5. `.gitignore` excluye los artefactos locales; los fixtures fuente de la suite sí se conservan.
 

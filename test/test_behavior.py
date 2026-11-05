@@ -29,9 +29,20 @@ class BehaviorTests(unittest.TestCase):
         """E2 + two same-second exits: 24 permutations and 15 incomplete subsets."""
         self.check_scenario("exit_reporting", [
             "TrackId", "Tracked", "InspectIdeaHistory", "ReportHasId", "ReportAddId",
-            "QueueExitReport", "ReportOrderVolume", "ReconcileExitReport",
+            "QueueExitReport", "ReportOrderVolume", "DiagnosticOrderVolume", "ReconcileIdeaPnl",
+            "ReconcileExitReport", "ResetExcursions", "UpdateExcursions", "ExitDiagnosticText",
             "RemoveExitReport", "FlushExitReports",
-        ], structures=["ExitReport"], declarations=["g_exit_reports"])
+        ], structures=["ExcursionStats", "DiagnosticPosition", "ExitReport"], declarations=["g_exit_reports", "g_excursions"])
+
+    def test_monetary_excursions_and_reconciliation(self):
+        """Joint MFE/MAE, E2, partial/simultaneous closes, races and final EXIT."""
+        self.check_scenario("excursions", [
+            "ReportHasId", "ReportAddId", "QueueExitReport", "ReportOrderVolume",
+            "DiagnosticOrderVolume", "ReconcileIdeaPnl", "ReconcileExitReport",
+            "ResetExcursions", "UpdateExcursions", "ObserveIdeaExcursions",
+            "ExitDiagnosticText", "RemoveExitReport", "FlushExitReports",
+        ], structures=["ExcursionStats", "DiagnosticPosition", "ExitReport"],
+           declarations=["g_exit_reports", "g_excursions"])
 
     def test_signal_modes_and_no_late_entries(self):
         """Actual OnTick: valid/invalid, initialization, pauses, missing data and both modes."""

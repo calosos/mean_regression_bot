@@ -28,6 +28,15 @@ class SourceContractTests(unittest.TestCase):
         self.assertNotRegex(code, r"\b(?:WebRequest|SendMail|SendNotification|FileOpen|iCustom)\s*\(")
         self.assertNotRegex(code, r"(?m)^\s*#import\b")
 
+    def test_excursion_diagnostics_never_control_trading_or_log_per_tick(self):
+        text = source()
+        for name in ["ObserveIdeaExcursions", "UpdateExcursions", "ReconcileIdeaPnl",
+                     "DiagnosticOrderVolume", "ExitDiagnosticText"]:
+            with self.subTest(function=name):
+                body = code_mask(function(text, name))
+                self.assertNotRegex(body, r"\btrade\s*\.|\b(?:BeginClose|CloseStep|Cooldown|OpenIdea|Log|Print\w*)\s*\(")
+                self.assertNotRegex(body, r"\b(?:state|history_ok|cooldown_until|target|g_sl|lot)\s*=(?!=)")
+
     def test_initialization_retains_tester_and_usd_guards(self):
         init = function(source(), "OnInit")
         # Rejecting the environment happens before indicator creation/trade setup.
