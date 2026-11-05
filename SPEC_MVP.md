@@ -72,9 +72,11 @@ El ATR utilizado para calcular los niveles de una idea debe permanecer congelado
 
 ---
 
-# 3. Detección de señales
+# 3. Detección de señales — modo INTRABAR predeterminado
 
-Las señales deben evaluarse durante la formación de la vela M5.
+Se admiten dos variantes experimentales seleccionadas por `InpSignalMode`: `INTRABAR` (predeterminada, reglas de esta sección) y `CLOSED_BAR` (confirmación al cierre, sección 17). No se presupone rentabilidad de ninguna variante.
+
+En `INTRABAR`, las señales deben evaluarse durante la formación de la vela M5.
 
 **No esperar al cierre para detectar o ejecutar una señal.**
 
@@ -147,7 +149,7 @@ Al detectar una señal válida:
 5. Ejecutar E1 inmediatamente a mercado.
 6. Obtener el precio real de ejecución.
 
-No esperar al inicio de una nueva vela.
+En `INTRABAR`, no esperar al inicio de una nueva vela. En `CLOSED_BAR`, ejecutar en el primer tick disponible de la nueva vela según la sección 17.
 
 ## E2: entrada pendiente
 
@@ -489,6 +491,7 @@ Exponer únicamente los parámetros necesarios:
 
 | Parámetro                      | Default      |
 | ------------------------------ | ------------ |
+| Modo de señal (`InpSignalMode`) | INTRABAR     |
 | Magic Number                   | 20261104     |
 | Capital de referencia          | 25000        |
 | Riesgo por idea                | 0.25%        |
@@ -520,7 +523,9 @@ Registrar los siguientes eventos:
 
 **SIGNAL**
 
-* Fecha/hora.
+* Modo de señal (`INTRABAR` o `CLOSED_BAR`).
+* Fecha/hora de apertura de la vela evaluada.
+* Fecha/hora del evento.
 * Dirección.
 * Precio.
 * Bollinger.
@@ -662,7 +667,7 @@ Si no están disponibles:
 El MVP estará completo cuando:
 
 1. El EA pueda compilarse en MetaTrader 5.
-2. Detecte señales durante la formación de las velas.
+2. Detecte señales durante la formación de las velas en `INTRABAR`, y confirme señales de la vela cerrada una sola vez por nueva vela en `CLOSED_BAR`.
 3. Abra E1 y coloque E2.
 4. Calcule el lotaje según el riesgo del 0.25%.
 5. Respete el filtro ATR > 8.
@@ -720,8 +725,60 @@ Estas decisiones complementan las reglas anteriores:
 1. **Moneda:** admitir únicamente cuentas denominadas en USD. Rechazar la inicialización en otras monedas; no convertir `InpRiskBaseUSD`.
 2. **Netting:** exigir uso exclusivo del símbolo por el EA. Bloquear nuevas ideas si hay posiciones u órdenes ajenas del símbolo. Detectar la mezcla mediante el historial de la posición, no solo su Magic actual. Ante intervención ajena que mezcle una posición, bloquear entradas, cancelar las pendientes propias y reconciliar/reintentar sus cancelaciones. No cerrar ni modificar automáticamente la posición mezclada. Registrar que requiere intervención manual y documentar esta limitación. No se puede garantizar exclusividad frente a operaciones externas concurrentes.
 3. **Reinicios:** limitar toda limpieza y reconstrucción al símbolo y Magic Number correspondientes. Si hay residuos propios, entrar en cierre, cancelar pendientes y cerrar posiciones propias, respetando la protección de posiciones netting mezcladas. No reconstruir una idea activa. Aplicar enfriamiento después de confirmar la limpieza. Sin residuos, reconstruir el enfriamiento desde cierres/cancelaciones propios recientes del historial.
-4. **Señales:** identificar cada señal por vela M5 y dirección. Consumirla cuando se evalúa con datos completos, incluso si falla riesgo o ejecución. No reintentar esa dirección en la misma vela. La falta de datos de indicadores no consume la señal. Reconciliar cualquier ejecución incierta antes de permitir otra idea.
+4. **Señales INTRABAR:** identificar cada señal por vela M5 y dirección. Consumirla cuando se evalúa con datos completos, incluso si falla riesgo o ejecución. No reintentar esa dirección en la misma vela. La falta de datos de indicadores no consume la señal. Reconciliar cualquier ejecución incierta antes de permitir otra idea.
 5. **Riesgo real:** después de E1 y antes de E2, recalcular E2 y SL desde el precio real ejecutado, normalizar al tick size y verificar el riesgo conjunto con el volumen real. Si excede el presupuesto o falla el cálculo, cerrar E1 y abortar. No reducir parcialmente E1 ni desplazar el SL para acomodar riesgo.
 6. **Fallos de cierre/cancelación:** conservar `CLOSING_IDEA`, reconciliar en ticks y transacciones y reintentar acciones necesarias sin duplicar solicitudes todavía pendientes de respuesta. No abandonar tras un máximo de intentos. Si E2 se ejecuta durante el cierre, cerrar también su exposición propia. Iniciar enfriamiento únicamente al confirmar ausencia de posiciones, órdenes y solicitudes propias pendientes. En posición mezclada solo cancelar pendientes propias y requerir intervención manual.
 7. **Ejecución parcial:** preferir ejecución completa cuando esté disponible. Si E1 o E2 se ejecutan parcialmente, cancelar remanentes y cerrar la idea, sin completar entradas con órdenes adicionales.
 8. **TP inicial:** aplicar desde E1 el mismo objetivo lógico y gestión por tick de las actualizaciones. Si ya se alcanzó, cerrar sin colocar E2. Si restricciones del bróker impiden asignarlo, supervisarlo por tick y reintentar su asignación, manteniendo obligatorio un SL válido.
+
+
+---
+
+# 17. Variantes experimentales de señal
+
+Añadir únicamente el parámetro enum `InpSignalMode`, con valores `INTRABAR` (predeterminado) y `CLOSED_BAR`. Las diferencias de esta sección se limitan a la confirmación y oportunidad de evaluación de la señal. Las reglas originales intrabar se conservan en la sección 3. Las instrucciones anteriores de no esperar al cierre/no exigir regreso dentro de bandas corresponden a `INTRABAR`; en `CLOSED_BAR` aplican expresamente las condiciones siguientes.
+
+## INTRABAR
+
+- Evaluar en cada tick Low/High, Bollinger y %K de `shift=0`, como hasta ahora.
+- No exigir Close dentro de bandas.
+- Congelar ATR de `shift=1`; TP inicial de `shift=0` y actualizaciones posteriores de `shift=1`.
+- Conservar la deduplicación por vela actual y dirección y la posibilidad de volver a leer indicadores faltantes en otro tick de esa vela si la señal no se consumió.
+
+## CLOSED_BAR
+
+Evaluar una sola vez al detectar una nueva vela M5. Todas las condiciones de señal deben proceder de la misma vela recién cerrada (`shift=1`):
+
+**Compra:**
+
+- `Low[1] <= LowerBand[1]`.
+- `Close[1] > LowerBand[1]` y `Close[1] < UpperBand[1]`.
+- `%K[1] < 10`.
+
+**Venta:**
+
+- `High[1] >= UpperBand[1]`.
+- `Close[1] > LowerBand[1]` y `Close[1] < UpperBand[1]`.
+- `%K[1] > 90`.
+
+No conservar condiciones intrabar de Stochastic. Los límites de Close y %K son estrictos; el toque de banda admite igualdad.
+
+### Ejecución y descarte
+
+- Ejecutar E1 a mercado en el primer tick disponible de la nueva vela, tras validar señal y riesgo.
+- Congelar `ATR[1]` de la vela de señal. El TP inicial sigue usando bandas y SMA20 de `shift=0`; sus actualizaciones posteriores siguen usando `shift=1`.
+- Identificar la señal por fecha/hora de apertura de la vela cerrada y dirección. Mantener registros de deduplicación separados por modo.
+- Registrar cada oportunidad de nueva vela antes de cualquier salida por idea activa, cierre en curso, enfriamiento o protección de exposición ajena. No recuperar una oportunidad omitida en ticks posteriores ni recorrer velas históricas pendientes.
+- Al adjuntar/reiniciar, tomar la vela M5 actual como referencia sin procesar el cierre anterior. Esperar la siguiente nueva vela. Si no hubo ticks durante varias velas, evaluar únicamente `shift=1` de la nueva vela disponible.
+- Si faltan datos al detectar la nueva vela, incluidas las bandas del TP inicial, registrar y descartar la oportunidad; no ejecutar esa señal tarde cuando los datos aparezcan.
+- Si una nueva vela comienza cuando el enfriamiento ya venció, se puede evaluar su vela recién cerrada. Si la oportunidad ocurrió con enfriamiento todavía activo, descartarla aunque venza después dentro de esa misma vela.
+
+### Reglas compartidas y logs
+
+Conservar Stochastic 14,3,3 predeterminado, ambas direcciones, dos entradas del mismo lote, E2 a 1 ATR y SL común a 3 ATR desde E1 ejecutada, riesgo predeterminado del 0.25%, filtro ATR, cálculo del volumen, TP dinámico, cierre monetario, enfriamiento y protección de operaciones ajenas. Conservar las correcciones técnicas de reintentos y reconciliación del PnL, sin cambiar la arquitectura monolítica.
+
+En cada log `SIGNAL` incluir `modo` y `vela` (fecha/hora de apertura de la vela evaluada), además de los datos existentes. En `CLOSED_BAR`, los valores Bollinger/%K del log corresponden a `shift=1`, aunque el TP inicial se calcule aparte con `shift=0`.
+
+### Validación específica
+
+Comprobar compras/ventas válidas, cierre dentro/fuera/en el límite de las bandas, igualdad y recuperación de los umbrales de Stochastic, rechazo si no existe toque de banda, ausencia de duplicados, ausencia de señales al iniciar/reiniciar y de entradas tardías tras datos faltantes, idea activa o enfriamiento. Verificar que se mantienen ATR[1], TP inicial[0] y actualizaciones TP[1]. Comparar `INTRABAR` con su comportamiento anterior, incluidos señales fuera de bandas y relectura de datos faltantes en la misma vela. Distinguir revisión estática, simulaciones auxiliares, compilación MQL5 y backtesting MT5.

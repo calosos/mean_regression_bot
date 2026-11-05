@@ -1,0 +1,29 @@
+# Python test caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.uv-cache/
+
+# Local test coverage/output
+.coverage
+.coverage.*
+htmlcov/
+/test/output/
+
+# MetaEditor/MT5 generated artifacts and local backtest reports
+*.ex5
+*.log
+*.log.*
+*.opt
+*.tst
+/backtest-results/
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

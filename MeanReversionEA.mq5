@@ -3,6 +3,8 @@
 #property description "Mean reversion MVP, Strategy Tester only, USD / M5"
 #include <Trade/Trade.mqh>
 
+enum SignalMode { INTRABAR, CLOSED_BAR };
+input SignalMode InpSignalMode=INTRABAR;
 input ulong  InpMagicNumber=20261104;
 input double InpRiskBaseUSD=25000;
 input double InpRiskPercent=0.25;
@@ -27,16 +29,84 @@ double frozen_atr=0,entry_price=0,lot=0,g_sl=0,target=0;
 int direction=0,entries=0;
 datetime idea_start=0,cooldown_until=0,tp_bar=0;
 datetime processed_buy=0,processed_sell=0;
+datetime g_last_signal_bar=0;
 ulong e1_order=0,e2_order=0;
 ulong position_ids[];
 string signal_key="";
 string exit_reason="";
 double realized=0;
+// Reporting outlives the operational idea/cooldown: never reuse current idea
+// globals to finish a previous idea's accounting after delayed history events.
+struct ExitReport
+{
+   datetime idea_id;
+   datetime closed_at;
+   ulong first_order;
+   ulong second_order;
+   bool exposed;
+   bool warned;
+   string reason;
+   ulong ids[];
+};
+ExitReport g_exit_reports[];
 // Uncertain requests remain locked until server confirmation or disappearance
 // of the referenced object. Never infer failure from elapsed time alone.
 struct PendingRequest { uint id; ulong ticket; ulong server_order; bool deletion; bool entry; };
 PendingRequest pending[];
 datetime last_problem=0;
+// Technical retry pacing only. Server/tester time, never Sleep or a session filter.
+const int MANAGEMENT_RETRY_SECONDS=5;
+struct ManagementRetry
+{
+   ulong ticket;
+   bool order_object;
+   datetime retry_after;
+   ulong last_cycle;
+};
+ManagementRetry g_management_retries[];
+ulong g_request_cycle=0;
+datetime g_market_retry_after=0;
+
+int ManagementRetryIndex(const ulong ticket,const bool order_object)
+{
+   for(int i=0;i<ArraySize(g_management_retries);i++)
+      if(g_management_retries[i].ticket==ticket && g_management_retries[i].order_object==order_object) return i;
+   int n=ArraySize(g_management_retries);
+   ArrayResize(g_management_retries,n+1);
+   g_management_retries[n].ticket=ticket;
+   g_management_retries[n].order_object=order_object;
+   g_management_retries[n].retry_after=0;
+   g_management_retries[n].last_cycle=0;
+   return n;
+}
+bool ManagementRequestAllowed(const ulong ticket,const bool order_object)
+{
+   if(TimeCurrent()<g_market_retry_after) return false;
+   int i=ManagementRetryIndex(ticket,order_object);
+   if(TimeCurrent()<g_management_retries[i].retry_after || g_management_retries[i].last_cycle==g_request_cycle) return false;
+   // Shared by TP modification and closing/deletion of this same object.
+   g_management_retries[i].last_cycle=g_request_cycle;
+   return true;
+}
+void RememberManagementResult(const ulong ticket,const bool order_object,const uint code)
+{
+   int i=ManagementRetryIndex(ticket,order_object);
+   g_management_retries[i].last_cycle=g_request_cycle;
+   bool completed=(code==TRADE_RETCODE_DONE || code==TRADE_RETCODE_DONE_PARTIAL || code==TRADE_RETCODE_NO_CHANGES);
+   g_management_retries[i].retry_after=completed ? 0 : TimeCurrent()+MANAGEMENT_RETRY_SECONDS;
+   // A market-closed rejection applies to the symbol, including its other tickets.
+   if(code==TRADE_RETCODE_MARKET_CLOSED) g_market_retry_after=TimeCurrent()+MANAGEMENT_RETRY_SECONDS;
+}
+void PruneManagementRetries()
+{
+   for(int i=ArraySize(g_management_retries)-1;i>=0;i--)
+   {
+      bool exists=g_management_retries[i].order_object ? OrderSelect(g_management_retries[i].ticket) : PositionSelectByTicket(g_management_retries[i].ticket);
+      if(exists) continue;
+      for(int j=i;j<ArraySize(g_management_retries)-1;j++) g_management_retries[j]=g_management_retries[j+1];
+      ArrayResize(g_management_retries,ArraySize(g_management_retries)-1);
+   }
+}
 
 void Log(const string tag,const string message,const bool essential=false)
 {
@@ -217,9 +287,10 @@ void CloseStep()
    for(int i=OrdersTotal()-1;i>=0;i--)
    {
       ulong t=OrderGetTicket(i);
-      if(t==0 || !OwnOrder() || Locked(t,true)) continue;
+      if(t==0 || !OwnOrder() || Locked(t,true) || !ManagementRequestAllowed(t,true)) continue;
       trade.OrderDelete(t);
       uint code=trade.ResultRetcode();
+      RememberManagementResult(t,true,code);
       if(Uncertain(code)) LockResult(t,true,false);
       else if(code!=TRADE_RETCODE_DONE) Problem("Cancelacion fallida: "+trade.ResultRetcodeDescription());
    }
@@ -227,10 +298,11 @@ void CloseStep()
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong t=PositionGetTicket(i);
-      if(PositionOwner(t)!=1 || Locked(t,false)) continue;
+      if(PositionOwner(t)!=1 || Locked(t,false) || !ManagementRequestAllowed(t,false)) continue;
       trade.SetTypeFillingBySymbol(_Symbol);
       trade.PositionClose(t,InpDeviationPoints);
       uint code=trade.ResultRetcode();
+      RememberManagementResult(t,false,code);
       if(Uncertain(code)) LockResult(t,false,false);
       else if(code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_DONE_PARTIAL)
          Problem("Cierre fallido: "+trade.ResultRetcodeDescription());
@@ -240,7 +312,8 @@ void CloseStep()
    {
       InspectIdeaHistory();
       if(manual_required || !history_ok) return;
-      Log("EXIT",StringFormat("motivo=%s PnL_realizado=%.2f entradas=%d",exit_reason,realized,entries),true);
+      QueueExitReport();
+      FlushExitReports();
       if(had_exposure) Cooldown(TimeCurrent());
       else { state=WAITING_SIGNAL; idea_start=0; ArrayResize(position_ids,0); }
    }
@@ -318,9 +391,10 @@ void SyncTP()
       if(PositionOwner(t)!=1 || !PositionSelectByTicket(t)) continue;
       if(!SamePrice(PositionGetDouble(POSITION_SL),g_sl)) { BeginClose("SL comun ausente o alterado"); return; }
       if(SamePrice(PositionGetDouble(POSITION_TP),broker_tp)) continue;
-      if(Locked(t,false)) continue;
+      if(Locked(t,false) || !ManagementRequestAllowed(t,false)) continue;
       trade.PositionModify(t,g_sl,broker_tp);
       uint code=trade.ResultRetcode();
+      RememberManagementResult(t,false,code);
       if(Uncertain(code)) LockResult(t,false,false);
       if(code==TRADE_RETCODE_DONE) Log("TP_UPDATE",StringFormat("posicion=%I64u objetivo=%.5f TP_servidor=%.5f resultado=%u",t,target,broker_tp,code));
       if(code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_NO_CHANGES) Problem("TP pendiente de sincronizar: "+trade.ResultRetcodeDescription());
@@ -334,8 +408,10 @@ void SyncTP()
       double order_tp=broker_tp;
       if(order_tp!=0 && (direction>0 ? order_tp-p<StopDistance() : p-order_tp<StopDistance())) order_tp=0;
       if(SamePrice(OrderGetDouble(ORDER_TP),order_tp)) continue;
+      if(!ManagementRequestAllowed(t,true)) continue;
       trade.OrderModify(t,p,g_sl,order_tp,ORDER_TIME_GTC,0,0);
       uint code=trade.ResultRetcode();
+      RememberManagementResult(t,true,code);
       if(Uncertain(code)) LockResult(t,true,false);
       if(code==TRADE_RETCODE_DONE) Log("TP_UPDATE",StringFormat("orden=%I64u objetivo=%.5f resultado=%u",t,target,code));
       if(code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_NO_CHANGES) Problem("TP de E2 pendiente de sincronizar");
@@ -357,6 +433,10 @@ bool SetInitialSL()
          trade.PositionModify(t,g_sl,0);
          code=trade.ResultRetcode();
       }
+      // Include the initial protection request in pacing if it aborts into
+      // CloseStep in this same tick. The INVALID_STOPS fallback above sends a
+      // different payload (SL without TP), not a duplicate retry.
+      RememberManagementResult(t,false,code);
       if(Uncertain(code)) LockResult(t,false,false);
       if(!PositionSelectByTicket(t) || !SamePrice(PositionGetDouble(POSITION_SL),g_sl)) return false;
    }
@@ -369,6 +449,77 @@ int SignalSide(const double low,const double high,const double lower,const doubl
    if(low<=lower && k<10 && processed_buy!=bar) return 1;
    if(high>=upper && k>90 && processed_sell!=bar) return -1;
    return 0;
+}
+// Consume the new-bar opportunity before any active idea/cooldown early return.
+// Use tick/server M5 time so unavailable series cannot create a late opportunity.
+bool TakeClosedBarOpportunity()
+{
+   datetime current_bar=BarOf(TimeCurrent());
+   datetime previous=g_last_signal_bar;
+   g_last_signal_bar=current_bar;
+   return previous!=0 && current_bar>previous;
+}
+int ClosedSignalSide(const MqlRates &candle,const double lower,const double upper,const double k)
+{
+   if(candle.close<=lower || candle.close>=upper) return 0;
+   return SignalSide(candle.low,candle.high,lower,upper,k,candle.time);
+}
+void SignalLog(const int side,const MqlRates &candle,const double mid,const double upper,const double lower,
+               const double k,const double atr_value)
+{
+   if(InpSignalMode==CLOSED_BAR)
+   {
+      // Log the exact shift=1 snapshot already used for confirmation. Reading
+      // a market quote is observational only; failure must not reject a signal.
+      datetime evaluated=TimeCurrent();
+      datetime nominal_close=candle.time+PeriodSeconds(PERIOD_M5);
+      long elapsed=(long)evaluated-(long)nominal_close;
+      bool inside=(candle.close>lower && candle.close<upper);
+      MqlTick quote={};
+      string market="mercado_disponible=false";
+      if(SymbolInfoTick(_Symbol,quote))
+         market=StringFormat("mercado_disponible=true mercado_tick=%s mercado_bid=%.5f mercado_ask=%.5f mercado_referencia_e1=%.5f",
+                TimeToString(quote.time,TIME_DATE|TIME_SECONDS),quote.bid,quote.ask,side>0 ? quote.ask : quote.bid);
+      Log("SIGNAL",StringFormat("modo=CLOSED_BAR evaluacion=%s vela=%s cierre_nominal=%s segundos_desde_cierre=%I64d direccion=%s "
+          "Open=%.5f High=%.5f Low=%.5f Close=%.5f LowerBand=%.10f SMA20=%.10f UpperBand=%.10f K=%.10f ATR=%.10f cierre_dentro_bandas=%s %s",
+          TimeToString(evaluated,TIME_DATE|TIME_SECONDS),TimeToString(candle.time,TIME_DATE|TIME_SECONDS),
+          TimeToString(nominal_close,TIME_DATE|TIME_SECONDS),elapsed,side>0 ? "BUY" : "SELL",
+          candle.open,candle.high,candle.low,candle.close,lower,mid,upper,k,atr_value,inside ? "true" : "false",market));
+      return;
+   }
+   Log("SIGNAL",StringFormat("modo=%s vela=%s direccion=%s precio=%.5f low=%.5f high=%.5f BB=%.5f/%.5f/%.5f K=%.5f ATR=%.5f",
+       InpSignalMode==INTRABAR ? "INTRABAR" : "CLOSED_BAR",TimeToString(candle.time,TIME_DATE|TIME_SECONDS),
+       side>0 ? "BUY" : "SELL",candle.close,candle.low,candle.high,lower,mid,upper,k,atr_value));
+}
+void EvaluateClosedBarSignal()
+{
+   MqlRates candle[1];
+   double mid,upper,lower,k,atr_value;
+   if(iTime(_Symbol,PERIOD_M5,0)!=g_last_signal_bar || CopyRates(_Symbol,PERIOD_M5,1,1,candle)!=1 ||
+      candle[0].time>=g_last_signal_bar || !Bands(1,mid,upper,lower) || !Value(stoch,0,1,k) ||
+      !Value(atr_handle,0,1,atr_value))
+   {
+      Log("REJECTED","modo=CLOSED_BAR nueva_vela="+TimeToString(g_last_signal_bar,TIME_DATE|TIME_SECONDS)+
+          " datos no disponibles; oportunidad descartada sin reintento tardio",true);
+      return;
+   }
+   int side=ClosedSignalSide(candle[0],lower,upper,k);
+   if(side==0) return;
+   // Signal confirmation uses shift=1; initial TP deliberately still uses shift=0.
+   double tp_mid,tp_upper,tp_lower;
+   if(!Bands(0,tp_mid,tp_upper,tp_lower))
+   {
+      Log("REJECTED","modo=CLOSED_BAR vela="+TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS)+
+          " bandas TP inicial no disponibles; oportunidad descartada",true);
+      return;
+   }
+   if(side>0) processed_buy=candle[0].time;
+   if(side<0) processed_sell=candle[0].time;
+   if(!SaveSignal()) return;
+   SignalLog(side,candle[0],mid,upper,lower,k,atr_value);
+   OpenIdea(side,atr_value,tp_mid,tp_upper,tp_lower);
+   TrackCurrent();
+   if(state==CLOSING_IDEA) CloseStep();
 }
 bool ATRAllowed(const double value) { return value>0 && value<=InpATRMax; }
 void OpenIdea(const int side,const double atr_value,const double mid,const double upper,const double lower)
@@ -429,6 +580,11 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
    Log("ENTRY",StringFormat("E1=%.5f E1_orden=%I64u E2=%.5f E2_orden=%I64u lote=%.8f SL=%.5f TP=%.5f riesgo=%.2f",entry_price,e1_order,e2,e2_order,lot,g_sl,target,risk),true);
 }
 
+void TrackId(const ulong id)
+{
+   if(id==0 || Tracked(id)) return;
+   int n=ArraySize(position_ids); ArrayResize(position_ids,n+1); position_ids[n]=id;
+}
 bool Tracked(const ulong id)
 {
    for(int i=0;i<ArraySize(position_ids);i++) if(position_ids[i]==id) return true;
@@ -441,8 +597,7 @@ void TrackCurrent()
       ulong t=PositionGetTicket(i);
       if(PositionOwner(t)!=1 || !PositionSelectByTicket(t)) continue;
       ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
-      if(Tracked(id)) continue;
-      int n=ArraySize(position_ids); ArrayResize(position_ids,n+1); position_ids[n]=id;
+      TrackId(id);
    }
 }
 // Rebuild from server history rather than relying on transaction arrival order.
@@ -453,6 +608,17 @@ void InspectIdeaHistory()
    TrackCurrent();
    if(!HistorySelect(idea_start,TimeCurrent()))
    { history_ok=false; Problem("Historial de idea no disponible"); return; }
+   // Discover all entry position IDs before summing any exits. E2 may have
+   // opened and closed between ticks, and history enumeration need not match
+   // transaction callback order (including deals in the very same second).
+   for(int i=0;i<HistoryDealsTotal();i++)
+   {
+      ulong d=HistoryDealGetTicket(i);
+      if(HistoryDealGetString(d,DEAL_SYMBOL)!=_Symbol || (ulong)HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagicNumber) continue;
+      ulong order=(ulong)HistoryDealGetInteger(d,DEAL_ORDER);
+      if((e1_order!=0 && order==e1_order) || (e2_order!=0 && order==e2_order))
+         TrackId((ulong)HistoryDealGetInteger(d,DEAL_POSITION_ID));
+   }
    double e2_volume=0; bool e1_seen=false,e2_seen=false;
    realized=0;
    for(int i=0;i<HistoryDealsTotal();i++)
@@ -482,6 +648,149 @@ void InspectIdeaHistory()
    entries=(e1_seen ? 1 : 0)+(e2_seen ? 1 : 0);
    if(e1_seen || e2_seen) had_exposure=true;
    if(state==ACTIVE_IDEA && e2_seen && e2_volume<lot-volume_step*0.1) BeginClose("E2 parcial");
+}
+
+
+// This code only reads history and emits logs. It never changes trading state,
+// levels, cooldown, ownership decisions or retry deadlines.
+bool ReportHasId(const ExitReport &report,const ulong id)
+{
+   for(int i=0;i<ArraySize(report.ids);i++) if(report.ids[i]==id) return true;
+   return false;
+}
+void ReportAddId(ExitReport &report,const ulong id)
+{
+   if(id==0 || ReportHasId(report,id)) return;
+   int n=ArraySize(report.ids); ArrayResize(report.ids,n+1); report.ids[n]=id;
+}
+void QueueExitReport()
+{
+   int n=ArraySize(g_exit_reports); ArrayResize(g_exit_reports,n+1);
+   g_exit_reports[n].idea_id=idea_start;
+   g_exit_reports[n].closed_at=TimeCurrent();
+   g_exit_reports[n].first_order=e1_order;
+   g_exit_reports[n].second_order=e2_order;
+   g_exit_reports[n].exposed=had_exposure;
+   g_exit_reports[n].warned=false;
+   g_exit_reports[n].reason=exit_reason;
+   ArrayResize(g_exit_reports[n].ids,ArraySize(position_ids));
+   ArrayCopy(g_exit_reports[n].ids,position_ids);
+}
+bool ReportOrderVolume(ExitReport &report,const ulong order,double &executed)
+{
+   executed=0;
+   if(order==0) return true;
+   if(!HistoryOrderSelect(order)) return false;
+   if(HistoryOrderGetString(order,ORDER_SYMBOL)!=_Symbol || (ulong)HistoryOrderGetInteger(order,ORDER_MAGIC)!=InpMagicNumber) return false;
+   ENUM_ORDER_STATE os=(ENUM_ORDER_STATE)HistoryOrderGetInteger(order,ORDER_STATE);
+   if(os!=ORDER_STATE_FILLED && os!=ORDER_STATE_CANCELED && os!=ORDER_STATE_EXPIRED && os!=ORDER_STATE_REJECTED) return false;
+   if(os!=ORDER_STATE_REJECTED)
+   {
+      executed=HistoryOrderGetDouble(order,ORDER_VOLUME_INITIAL);
+      if(os!=ORDER_STATE_FILLED) executed-=HistoryOrderGetDouble(order,ORDER_VOLUME_CURRENT);
+      if(executed<0) return false;
+   }
+   if(executed>0) ReportAddId(report,(ulong)HistoryOrderGetInteger(order,ORDER_POSITION_ID));
+   return true;
+}
+bool ReconcileExitReport(ExitReport &report,double &pnl,int &entry_count)
+{
+   pnl=0; entry_count=0;
+   double expected_first=0,expected_second=0;
+   if(!ReportOrderVolume(report,report.first_order,expected_first) ||
+      !ReportOrderVolume(report,report.second_order,expected_second)) return false;
+   // Full position lifetime is needed for restart cleanup too. Selection is
+   // inclusive of the whole current second; no cursor based on DEAL_TIME.
+   if(!HistorySelect(0,TimeCurrent())) return false;
+   for(int i=0;i<HistoryDealsTotal();i++)
+   {
+      ulong d=HistoryDealGetTicket(i);
+      if(HistoryDealGetString(d,DEAL_SYMBOL)!=_Symbol || (ulong)HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagicNumber) continue;
+      ulong order=(ulong)HistoryDealGetInteger(d,DEAL_ORDER);
+      if((report.first_order!=0 && order==report.first_order) || (report.second_order!=0 && order==report.second_order))
+         ReportAddId(report,(ulong)HistoryDealGetInteger(d,DEAL_POSITION_ID));
+   }
+   double incoming[],outgoing[];
+   ArrayResize(incoming,ArraySize(report.ids)); ArrayInitialize(incoming,0);
+   ArrayResize(outgoing,ArraySize(report.ids)); ArrayInitialize(outgoing,0);
+   ulong entry_orders[];
+   double first_volume=0,second_volume=0;
+   for(int i=0;i<HistoryDealsTotal();i++)
+   {
+      ulong d=HistoryDealGetTicket(i);
+      if(HistoryDealGetString(d,DEAL_SYMBOL)!=_Symbol) continue;
+      ulong id=(ulong)HistoryDealGetInteger(d,DEAL_POSITION_ID);
+      if(!ReportHasId(report,id)) continue;
+      ENUM_DEAL_TYPE type=(ENUM_DEAL_TYPE)HistoryDealGetInteger(d,DEAL_TYPE);
+      if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL) continue;
+      // A mixed netting position has no separable EA result. Do not fabricate it.
+      if(netting && (ulong)HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagicNumber) return false;
+      ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(d,DEAL_ENTRY);
+      if(entry==DEAL_ENTRY_INOUT) return false; // Reversals are outside this EA.
+      double volume=HistoryDealGetDouble(d,DEAL_VOLUME);
+      ulong order=(ulong)HistoryDealGetInteger(d,DEAL_ORDER);
+      for(int j=0;j<ArraySize(report.ids);j++)
+      {
+         if(report.ids[j]!=id) continue;
+         if(entry==DEAL_ENTRY_IN) incoming[j]+=volume;
+         else if(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY) outgoing[j]+=volume;
+      }
+      if(entry==DEAL_ENTRY_IN)
+      {
+         if((ulong)HistoryDealGetInteger(d,DEAL_MAGIC)!=InpMagicNumber) return false;
+         if(order==report.first_order) first_volume+=volume;
+         if(order==report.second_order) second_volume+=volume;
+         bool seen=false;
+         for(int j=0;j<ArraySize(entry_orders);j++) if(entry_orders[j]==order) { seen=true; break; }
+         if(!seen) { int n=ArraySize(entry_orders); ArrayResize(entry_orders,n+1); entry_orders[n]=order; }
+      }
+      pnl+=HistoryDealGetDouble(d,DEAL_PROFIT)+HistoryDealGetDouble(d,DEAL_SWAP)+
+           HistoryDealGetDouble(d,DEAL_COMMISSION)+HistoryDealGetDouble(d,DEAL_FEE);
+   }
+   double tolerance=volume_step*0.1;
+   if(MathAbs(first_volume-expected_first)>tolerance || MathAbs(second_volume-expected_second)>tolerance) return false;
+   if(report.exposed && ArraySize(report.ids)==0) return false;
+   for(int i=0;i<ArraySize(report.ids);i++)
+      if(incoming[i]<=0 || MathAbs(incoming[i]-outgoing[i])>tolerance) return false;
+   entry_count=ArraySize(entry_orders);
+   return !report.exposed || entry_count>0;
+}
+void RemoveExitReport(const int index)
+{
+   // Copy fields explicitly because snapshots own independent dynamic ID arrays.
+   for(int j=index;j<ArraySize(g_exit_reports)-1;j++)
+   {
+      g_exit_reports[j].idea_id=g_exit_reports[j+1].idea_id;
+      g_exit_reports[j].closed_at=g_exit_reports[j+1].closed_at;
+      g_exit_reports[j].first_order=g_exit_reports[j+1].first_order;
+      g_exit_reports[j].second_order=g_exit_reports[j+1].second_order;
+      g_exit_reports[j].exposed=g_exit_reports[j+1].exposed;
+      g_exit_reports[j].warned=g_exit_reports[j+1].warned;
+      g_exit_reports[j].reason=g_exit_reports[j+1].reason;
+      ArrayResize(g_exit_reports[j].ids,ArraySize(g_exit_reports[j+1].ids));
+      ArrayCopy(g_exit_reports[j].ids,g_exit_reports[j+1].ids);
+   }
+   ArrayResize(g_exit_reports,ArraySize(g_exit_reports)-1);
+}
+void FlushExitReports()
+{
+   for(int i=ArraySize(g_exit_reports)-1;i>=0;i--)
+   {
+      double pnl=0; int count=0;
+      if(ReconcileExitReport(g_exit_reports[i],pnl,count))
+      {
+         PrintFormat("EXIT %s idea=%I64d cierre=%s motivo=%s PnL_realizado=%.2f entradas=%d",
+                     TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),(long)g_exit_reports[i].idea_id,
+                     TimeToString(g_exit_reports[i].closed_at,TIME_DATE|TIME_SECONDS),g_exit_reports[i].reason,pnl,count);
+         RemoveExitReport(i);
+      }
+      else if(!g_exit_reports[i].warned)
+      {
+         PrintFormat("EXIT_PENDING %s idea=%I64d historial aun incompleto; resultado definitivo pendiente",
+                     TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),(long)g_exit_reports[i].idea_id);
+         g_exit_reports[i].warned=true;
+      }
+   }
 }
 
 datetime RecentOwnEnd()
@@ -534,7 +843,7 @@ int OnInit()
    { Print("INIT_FAILED: cuenta del probador debe estar denominada en USD"); return INIT_PARAMETERS_INCORRECT; }
    if(_Period!=PERIOD_M5 || StringFind(_Symbol,"XAUUSD")<0)
    { Print("INIT_FAILED: utilizar XAUUSD (se admiten prefijos/sufijos) en M5"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpMagicNumber==0 || !MathIsValidNumber(InpRiskBaseUSD) || InpRiskBaseUSD<=0 ||
+   if((InpSignalMode!=INTRABAR && InpSignalMode!=CLOSED_BAR) || InpMagicNumber==0 || !MathIsValidNumber(InpRiskBaseUSD) || InpRiskBaseUSD<=0 ||
       !MathIsValidNumber(InpRiskPercent) || InpRiskPercent<=0 || InpRiskPercent>100 ||
       InpBollingerPeriod<2 || !MathIsValidNumber(InpBollingerDeviation) || InpBollingerDeviation<=0 ||
       InpStochasticK<1 || InpStochasticD<1 || InpStochasticSlowing<1 || InpATRPeriod<1 ||
@@ -547,6 +856,7 @@ int OnInit()
    if(tick_size<=0 || volume_min<=0 || volume_step<=0 || volume_max<volume_min || !MathIsValidNumber(Budget()) || Budget()<=0)
       return INIT_FAILED;
    signal_key=SignalKey();
+   if(InpSignalMode==CLOSED_BAR) signal_key+="C.";
    if(GlobalVariableCheck(signal_key+"B")) processed_buy=(datetime)GlobalVariableGet(signal_key+"B");
    if(GlobalVariableCheck(signal_key+"S")) processed_sell=(datetime)GlobalVariableGet(signal_key+"S");
    netting=(ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
@@ -558,6 +868,7 @@ int OnInit()
    stoch=iStochastic(_Symbol,PERIOD_M5,InpStochasticK,InpStochasticD,InpStochasticSlowing,MODE_SMA,STO_LOWHIGH);
    atr_handle=iATR(_Symbol,PERIOD_M5,InpATRPeriod);
    if(bands==INVALID_HANDLE || stoch==INVALID_HANDLE || atr_handle==INVALID_HANDLE) return INIT_FAILED;
+   g_last_signal_bar=BarOf(TimeCurrent()); // Do not evaluate a historical close on init/reinit.
    CheckOwnership();
    if(manual_required) return INIT_SUCCEEDED;
    if(!history_ok) { state=CLOSING_IDEA; exit_reason="Inicio con propiedad no verificable"; return INIT_SUCCEEDED; }
@@ -578,12 +889,17 @@ int OnInit()
 }
 void OnDeinit(const int reason)
 {
+   FlushExitReports();
    if(bands!=INVALID_HANDLE) IndicatorRelease(bands);
    if(stoch!=INVALID_HANDLE) IndicatorRelease(stoch);
    if(atr_handle!=INVALID_HANDLE) IndicatorRelease(atr_handle);
 }
 void OnTick()
 {
+   bool closed_bar_tick=(InpSignalMode==CLOSED_BAR && TakeClosedBarOpportunity());
+   g_request_cycle++;
+   PruneManagementRetries();
+   FlushExitReports();
    ReconcilePending(); CheckOwnership();
    if(!manual_required && history_ok && (state==WAITING_SIGNAL || state==COOLDOWN) && (OwnPositions()>0 || OwnOrders()>0))
    {
@@ -596,7 +912,11 @@ void OnTick()
    if(state==CLOSING_IDEA) { CloseStep(); return; }
    if(!history_ok) return;
    datetime bar=iTime(_Symbol,PERIOD_M5,0);
-   if(bar==0) return;
+   if(bar==0)
+   {
+      if(closed_bar_tick) Log("REJECTED","modo=CLOSED_BAR serie M5 no disponible; oportunidad descartada",true);
+      return;
+   }
    if(state==COOLDOWN)
    {
       if(TimeCurrent()<cooldown_until) return;
@@ -633,6 +953,11 @@ void OnTick()
       return;
    }
    if(ArraySize(pending)>0 || OwnPositions()>0 || OwnOrders()>0 || ForeignExposure()) return;
+   if(InpSignalMode==CLOSED_BAR)
+   {
+      if(closed_bar_tick) EvaluateClosedBarSignal();
+      return;
+   }
    double mid,upper,lower,k,atr_value;
    MqlRates current[1];
    if(!Bands(0,mid,upper,lower) || !Value(stoch,0,0,k) || !Value(atr_handle,0,1,atr_value) || CopyRates(_Symbol,PERIOD_M5,0,1,current)!=1)
@@ -641,7 +966,7 @@ void OnTick()
    if(side>0) processed_buy=bar;
    if(side<0) processed_sell=bar;
    if(side==0 || !SaveSignal()) return;
-   Log("SIGNAL",StringFormat("direccion=%s precio=%.5f low=%.5f high=%.5f BB=%.5f/%.5f/%.5f K=%.5f ATR=%.5f",side>0 ? "BUY" : "SELL",current[0].close,current[0].low,current[0].high,lower,mid,upper,k,atr_value));
+   SignalLog(side,current[0],mid,upper,lower,k,atr_value);
    OpenIdea(side,atr_value,mid,upper,lower);
    TrackCurrent();
    if(state==CLOSING_IDEA) CloseStep();
@@ -654,6 +979,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
       {
          if(pending[i].id==0 || result.request_id!=pending[i].id) continue;
          if(result.order!=0) pending[i].server_order=result.order;
+         if(!pending[i].entry && !Uncertain(result.retcode))
+            RememberManagementResult(pending[i].ticket,pending[i].deletion,result.retcode);
          // TIMEOUT / CONNECTION are final failure responses to this request.
          // The next tick reconciles live exposure before any retry.
          if(result.retcode!=TRADE_RETCODE_PLACED && result.retcode!=TRADE_RETCODE_LOCKED) RemovePending(i);
@@ -666,10 +993,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
       ulong id=(ulong)HistoryDealGetInteger(trans.deal,DEAL_POSITION_ID);
       ulong magic=(ulong)HistoryDealGetInteger(trans.deal,DEAL_MAGIC);
       ENUM_DEAL_TYPE type=(ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal,DEAL_TYPE);
+      ulong order=(ulong)HistoryDealGetInteger(trans.deal,DEAL_ORDER);
+      if(magic==InpMagicNumber && (state==ACTIVE_IDEA || state==CLOSING_IDEA) &&
+         ((e1_order!=0 && order==e1_order) || (e2_order!=0 && order==e2_order))) TrackId(id);
       if(netting && magic!=InpMagicNumber && Tracked(id) && (type==DEAL_TYPE_BUY || type==DEAL_TYPE_SELL))
          Quarantine("Transaccion ajena sobre posicion netting de la idea");
    }
    ReconcilePending();
    if(state==ACTIVE_IDEA || state==CLOSING_IDEA) InspectIdeaHistory();
+   FlushExitReports();
    // Execute reconciled actions on the next tick, not recursively in this handler.
 }
