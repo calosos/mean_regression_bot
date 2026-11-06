@@ -1,80 +1,120 @@
-# Cierre del experimento de investigación — Mean Reversion EA
+# Resultados de investigación — XAUUSD M5
 
-Fecha de cierre documental: 2026-11-05.
+Fecha de cierre de sesión: 6 de noviembre de 2026.
+Estado: investigación en pausa; ninguna variante se considera validada para operar en real.
 
-**No se demostró una ventaja suficiente. Esta versión no está validada para operar en real.** Se conserva como experimento de investigación, con su EA, especificación, documentación y pruebas auxiliares. Este cierre no declara completada la validación operativa ni introduce cambios en la lógica.
+## Objetivo y alcance
 
-## Alcance y evidencia
+Investigar entradas de regreso a la media y sus salidas mediante un EA monolítico MQL5. El objetivo de investigación del usuario es encontrar un rendimiento del orden de 4–6% mensual con consistencia; los resultados actuales no lo demuestran.
 
-El experimento implementa regreso a la media en XAUUSD M5 con Bollinger, Stochastic y ATR, dos entradas del mismo lote, riesgo configurado del 0.25%, SL común y TP dinámico. Se estudiaron señales intrabar y confirmación al cierre. Los parámetros predeterminados conservados en el EA son Stochastic 14,3,3 e `InpSignalMode=INTRABAR`.
+Las etiquetas V1–V8 identifican hipótesis de investigación, no versiones del playbook original. Este documento resume los informes y diarios revisados durante la sesión; no sustituye los archivos originales ni una auditoría del código.
 
-Para este resumen se consultaron `README.md`, `SPEC_MVP.md`, el registro de verificaciones del proyecto y el Diario existente del agente:
+## Hipótesis V1–V8
 
-```text
-%APPDATA%/MetaQuotes/Tester/6FBEE76C719DC78AB2AE839B5A0C7442/
-Agent-127.0.0.1-3001/logs/20261104.log
-```
+| Versión | Propuesta | Resultado observado y decisión |
+| --- | --- | --- |
+| V1 — RSI | Sustituir Stochastic por RSI14, niveles 30/70, manteniendo Bollinger. | No se identificó una mejora suficiente para elegirla como base. No se consolidan cifras aquí porque no quedaron disponibles en el resumen de esta sesión. |
+| V2 — Sin oscilador | Cierre fuera de Bollinger, posterior cierre dentro y entrada en la siguiente vela. Una sola entrada; objetivo SMA20 dinámico. | Base BB_REENTRY de los experimentos posteriores. Resultados dependientes del período. |
+| V3 — MACD | Confirmar recuperación del histograma MACD12/26/9, sin exigir cruce completo. | Julio–octubre +298.61 USD; abril–junio −165.07 USD. Redujo entradas sin sostener la mejora. Archivada. |
+| V4 — ADX | ADX14 <25, <20, o <25 y descendiendo. | ADX <20 fue la variante más interesante: enero–octubre +586.15 USD, DD 0.89%, 78 operaciones; 2025 +243.71 USD, DD 2.44%, 80 operaciones. Rendimiento insuficiente para el objetivo planteado. |
+| V5 — Ancho Bollinger | BBW no creciente, comienzo de contracción, o debajo del percentil70 de 100 velas anteriores. | Julio–octubre: no creciente +132.26 USD con 22 operaciones; percentil70 +508.76 USD con 308. Inicio de contracción omitido por decisión, no descartado mediante backtest. |
+| V6 — Mechas | Toque de banda, cierre dentro y mecha mínima de 40%, 50% o 60% del rango. | Julio–octubre: −1,855.84 / −1,611.92 / −1,641.78 USD, respectivamente. Archivada. |
+| V7 — Desviación ATR | D=(Close−SMA20)/ATR14; preparación por sobreextensión y entrada tras regreso confirmado. | Umbrales 1.5 / 2 / 2.5 / 3 ATR: −2,804.11 / −2,866.33 / −2,260.15 / −684.10 USD en julio–octubre. Todas negativas. |
+| V8 — Referencia | Comparar SMA20, EMA20 y VWAP con reglas de entrada constantes. | Pendiente. No se ejecutó una comparación directa SMA/EMA/VWAP. Las pruebas de salida siguientes son un bloque separado. |
 
-Los importes siguientes proceden de sus líneas `initial deposit`, parámetros de entrada, `INIT modelo=hedging` y `final balance`. Son ejecuciones históricas ya realizadas; no se lanzó otro backtest para este cierre. No se dispone de una correspondencia verificada mediante hash entre cada EX5 histórico y el fuente actual, que incorpora correcciones y diagnóstico añadidos posteriormente.
+## Condiciones comunes de las pruebas de salida
 
-## Variantes y resultados históricos disponibles
+- XAUUSD M5, Axi-US50-Demo, depósito inicial 25,000 USD.
+- Modelado: cada tick basado en ticks reales; informes revisados de S1–S4 con calidad 100%.
+- Estrategia BB_REENTRY, una sola entrada, riesgo 0.25% sobre base fija de 25,000 USD: presupuesto 62.50 USD por idea antes de redondeos y ejecución.
+- SL inicial: 2 ATR; ATR14 congelado al entrar, tomado de la vela de confirmación cerrada.
+- Bollinger: período20, desviación2.5.
+- Filtros ADX, MACD y BBW apagados.
+- Protección de fin de semana activada: bloquear nuevas entradas 60 minutos antes y solicitar cierre 30 minutos antes del cierre semanal según sesiones del símbolo.
+- Apalancamiento1:30; ejecución ideal, sin optimización.
+- Conservación de las reglas de reconciliación y enfriamiento.
 
-Todas las ejecuciones de la tabla declaran depósito inicial de **25,000 USD**, apalancamiento **1:30** y modelo de cuenta **hedging**. Los parámetros registrados incluyen Bollinger 20/2.5, ATR 14 con máximo 8, TP factor 0.90 y referencia de riesgo 25,000 USD al 0.25%.
+El presupuesto calculado no garantiza una pérdida máxima exacta: hubo ejecuciones con pérdidas superiores por condiciones de mercado. El informe de banda opuesta julio–octubre contiene una pérdida de −178.84 USD cuya causa no quedó explicada con su diario.
 
-La variación de saldo es `saldo final − depósito inicial`. El porcentaje es esa variación dividida entre 25,000; no es una rentabilidad anualizada, un profit factor ni una medida ajustada al riesgo. Los periodos son los límites de inicio/fin mostrados por el probador.
+## Experimentos de salida
 
-| Variante histórica | Stochastic K,D,Slowing | Periodo registrado | Saldo final USD | Variación USD | Variación % |
-| --- | --- | --- | ---: | ---: | ---: |
-| Intrabar anterior al enum | 14,3,3 | 2026-07-01 → 2026-08-01 | 24,699.65 | -300.35 | -1.20% |
-| Intrabar anterior al enum | 14,3,3 | 2026-08-01 → 2026-09-01 | 25,115.17 | +115.17 | +0.46% |
-| Intrabar anterior al enum | 14,3,3 | 2026-09-01 → 2026-10-01 | 24,311.12 | -688.88 | -2.76% |
-| Intrabar anterior al enum | 14,3,3 | 2026-08-01 → 2026-11-01 | 25,252.06 | +252.06 | +1.01% |
-| Intrabar anterior al enum | 14,4,4 | 2026-07-01 → 2026-11-01 | 25,451.93 | +451.93 | +1.81% |
-| Intrabar anterior al enum | 20,4,4 | 2026-07-01 → 2026-11-01 | 24,901.33 | -98.67 | -0.39% |
-| CLOSED_BAR (`InpSignalMode=1`) | 14,3,3 | 2026-07-01 → 2026-11-01 | 24,617.43 | -382.57 | -1.53% |
-| CLOSED_BAR, comprobación corta | 14,3,3 | 2026-07-01 → 2026-07-02 | 24,889.30 | -110.70 | -0.44% |
+- S0: cerrar todo en SMA20 de shift=1; objetivo actualizado con cada nueva vela.
+- S1: objetivo dinámico E1 + 0.5 × (SMA20[1] − E1), usando E1 ejecutado fijo.
+- S2: banda opuesta dinámica de shift=1: superior para compras, inferior para ventas.
+- S3: TP fijo de 2 ATR congelados desde E1; SL también de 2 ATR.
+- S4: cerrar 50% al alcanzar SMA20 dinámica; tras confirmar el parcial, gestionar el remanente con trailing de 1 ATR congelado desde el mejor Bid/Ask observado a partir de esa confirmación. SL solo puede ajustarse para reducir riesgo. Si el volumen no permite una división válida, cerrar todo en SMA20.
 
-Las versiones anteriores no incluían `InpSignalMode` en sus entradas: su carácter intrabar se identifica por el comportamiento registrado y el desarrollo documentado. No se les atribuye retrospectivamente un valor enum que no aparece en el Diario.
+| Salida | Enero–marzo | Abril–junio | Julio–octubre | Suma de ejecuciones separadas | Rendimiento sobre 25,000 USD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S0 — SMA20 | −838.11 | +584.60 | +727.94 | +474.43 USD | +1.90% |
+| S1 — Mitad hacia SMA20 | Sin probar | Sin probar | −139.54 | No comparable | −0.56% en julio–octubre |
+| S2 — Banda opuesta | −109.15 | +479.99 | +2,612.87 | +2,983.71 USD | +11.93% |
+| S3 — TP fijo 2 ATR | +10.82 | −155.95 | +2,176.98 | +2,031.85 USD | +8.13% |
+| S4 — Parcial y trailing | −647.23 | +638.40 | +1,369.68 | +1,360.85 USD | +5.44% |
 
-Referencias de líneas del archivo del agente, en el orden de las primeras seis filas: inicio/entradas y saldo final **96638–96651 / 109010**, **12372–12385 / 24031**, **27–40 / 12346**, **24057–24070 / 59945**, **109037–109050 / 147537** y **147557–147570 / 183675**. Para CLOSED_BAR: **183710–183724 / 201606** y **219575–219589 / 219872**.
+Las fechas usadas fueron [2026.01.01, 2026.04.01), [2026.04.01, 2026.07.01) y [2026.07.01, 2026.11.01). La suma no sustituye un backtest continuo: reiniciar el EA puede afectar operaciones en los límites, estado y enfriamiento. No deben sumarse los drawdowns ni interpretarse estos rendimientos como tasas mensuales estables.
 
-La ejecución intrabar de agosto–noviembre repitió saldo final de 25,252.06 en una ejecución posterior (entradas 60724–60737; saldo 96613). CLOSED_BAR de julio–noviembre también repitió 24,617.43 (entradas 201640–201654; saldo 219536). Estas repeticiones del mismo periodo no son muestras independientes ni evidencia fuera de muestra.
+### Drawdown máximo de equidad por ejecución
 
-Existe además una ejecución intrabar corta de diagnóstico, 2026-09-27 → 2026-09-29, con Stochastic 14,3,3 y saldo final 25,001.46 USD, variación +1.46 USD (entradas 59980–59993; saldo 60690). No constituye una validación estadística de la estrategia.
+| Salida | Enero–marzo | Abril–junio | Julio–octubre |
+| --- | ---: | ---: | ---: |
+| S0 — SMA20 | 3.82% | 2.72% | 5.02% |
+| S1 — Mitad SMA20 | — | — | 3.55% |
+| S2 — Banda opuesta | 3.44% | 4.83% | 5.75% |
+| S3 — TP fijo 2 ATR | 3.09% | 4.47% | 3.53% |
+| S4 — Parcial y trailing | 3.20% | 2.68% | 4.47% |
 
-## Interpretación y límites de los resultados
+S2 enero–marzo se repitió a1:30 tras detectar una ejecución a1:400. Beneficio, operaciones y drawdown fueron idénticos: −109.15 USD, 227 operaciones, DD3.44%.
 
-Los resultados disponibles tienen signos distintos según parámetros y periodo. El resultado positivo de 14,4,4 en julio–noviembre no demuestra robustez ni superioridad: no se conserva aquí un ensayo controlado de todas las variantes con el mismo binario, periodo y condiciones. Tampoco se deben sumar los resultados mensuales para reconstruir una prueba continua, pues cada ejecución inicia con su propio estado y depósito.
+## Revisión del diario S4 julio–octubre
 
-El Diario advierte de **8 minutos sin ticks reales** en agosto de 2026 y uso de generación de ticks para esos huecos en las ejecuciones que abarcan ese intervalo. Por tanto, esos resultados no deben describirse como procedentes exclusivamente de ticks reales completos.
+- INIT confirmó BB_REENTRY, señal CLOSED_BAR y salida EXIT_HALF_SMA20_TRAIL_ATR.
+- 480 entradas/ideas y 480 registros EXIT, sin duplicación de esos registros por idea.
+- 305 parciales confirmados, sin confirmaciones duplicadas por idea.
+- 23,062 actualizaciones de trailing; no se encontraron actualizaciones antes de confirmar el parcial ni movimientos que aflojaran el SL.
+- La distancia del trailing registrada fue compatible con 1 ATR congelado dentro de la tolerancia de normalización examinada.
+- 10 rechazos de parcial por mercado cerrado en una idea, con reintentos y posterior confirmación.
+- Suma de PnL realizado por idea: +1,369.68 USD, coincidente con el informe.
+- Las 785 operaciones del informe incluyen los cierres parciales: no son 785 ideas independientes. Por la misma razón, la tasa de acierto del informe S4 no es directamente comparable con una tasa por idea de estrategias sin parciales.
 
-No se han consolidado ni validado en este cierre drawdown, profit factor, tasa de acierto, distribución de R, sensibilidad completa a costes, pruebas fuera de muestra o significancia estadística. No se inventan estos indicadores a partir del saldo final. No se ha demostrado una ventaja suficiente para justificar uso real; esto tampoco equivale a demostrar que toda configuración posible sea necesariamente perdedora.
+Estos controles describen lo observado en una ejecución hedging. No prueban todos los escenarios de error ni el comportamiento en netting.
 
-## Hallazgos técnicos y diagnóstico
+## Conclusiones y límites
 
-- Se corrigieron los reintentos excesivos de gestión mediante esperas técnicas de 5 segundos y control de duplicados, sin añadir filtros horarios. La reducción a 12 rechazos por minuto corresponde a una prueba simulada de mercado cerrado, no a un resultado de rentabilidad ni a una nueva ejecución MT5.
-- Se corrigió el resumen de PnL para esperar a reconciliar los deals y conservar la identidad de la idea. El caso de investigación con dos compras de 0.03 en 4246.68 y 4239.73, cerradas en 4234.89, equivale a -49.89 USD para contrato de 100 onzas y sin otros costes. Las pruebas auxiliares reproducen la suma y el cierre en el mismo segundo; no se trata de un resultado agregado de la estrategia.
-- Se verificaron en el Diario las señales CLOSED_BAR evaluadas después de pausas: 2026-07-06 01:00:02 sobre la vela de 2026-07-03 19:55; 2026-07-22 01:00 sobre la de 2026-07-21 23:55; y 2026-10-27 01:00 sobre la de 2026-10-26 23:55. Los retrasos desde el cierre nominal fueron 190802, 3600 y 3600 segundos. Los tres envíos de E1 fueron rechazados por `Market closed`, con `entradas=0`. No se añadió filtro de antigüedad ni descarte por horario.
-- MFE/MAE monetarios conjuntos se añadieron como diagnóstico, incluyendo realizado y flotante reconciliados. Su comportamiento está cubierto por pruebas auxiliares; no se dispone aquí de un análisis agregado de MFE/MAE de un backtest de la última versión.
-- El Probador puede liquidar posiciones al finalizar el periodo sin generar el `EXIT` habitual del EA. El saldo final del probador y una suma incompleta de logs EXIT no son intercambiables; también hay que revisar las liquidaciones finales y los resúmenes pendientes.
+1. Cambiar la salida afecta al rendimiento. S2 obtuvo la mayor suma y S3 fue mejor en beneficio/drawdown durante julio–octubre, sin demostrar superioridad estable en todos los períodos.
+2. S4 mejoró frente a SMA20 durante abril–junio y julio–octubre, pero perdió en enero–marzo.
+3. El beneficio de las variantes con mayor rendimiento se concentró en julio–octubre. No se demostró el objetivo mensual buscado.
+4. Muchas variantes se probaron sobre los mismos períodos. Son resultados exploratorios; ninguno de esos períodos constituye ya una validación independiente para seleccionar variantes posteriores.
+5. V8 sigue pendiente. No debe registrarse como probada ni fallida.
+6. Los informes tienen las condiciones de costes de sus ejecuciones; no se ha completado una evaluación realista de costes y ejecución. Se decidió posponer ese bloque hasta observar una ventaja suficiente, sin confundir los resultados con rentabilidad en real.
+7. Se conserva el EA y se pausa la búsqueda de nuevas combinaciones. No se justifica aumentar riesgo con esta evidencia.
 
-## Estado de verificación
+## Próxima sesión: diagnóstico, sin cambiar reglas
 
-| Tipo de evidencia | Estado al cerrar |
-| --- | --- |
-| Revisión estática | Documentadas las reglas y la conservación de la operativa al añadir diagnóstico |
-| Suite offline | Última ejecución registrada: 14 tests pasados; Python/unittest, fragmentos actuales compilados con C++ y respuestas MT5 simuladas |
-| Compilación MQL5 | El usuario reportó compilación de una versión anterior; la última versión con MFE/MAE no se compiló desde este entorno por el bloqueo de interoperabilidad Windows/WSL |
-| Backtests MT5 | Existen las ejecuciones históricas de la tabla; no validan automáticamente el fuente actual ni las correcciones posteriores |
-| Operación en real | No realizada ni validada; el EA mantiene su restricción al Probador |
+Duración propuesta: máximo 2 horas.
 
-Las pruebas auxiliares verifican escenarios funcionales y regresiones. No constituyen compilación MQL5, un backtest completo ni demostración de rentabilidad.
+### Base fija de diagnóstico
 
-## Pendientes explícitos
+BB_REENTRY; una entrada; SL2 ATR; TP fijo2 ATR; riesgo0.25%; base25,000 USD; ADX/MACD/BBW apagados; protección semanal60/30; XAUUSD M5; ticks reales; apalancamiento1:30; logs detallados.
 
-1. **Netting en MT5:** validar consolidación E1/E2, SL/TP comunes, riesgo y PnL; mezcla con intervenciones ajenas; cancelación de pendientes propias y protección de la posición mezclada. Los mocks no sustituyen esta validación.
-2. **Reinicios en MT5:** validar limpieza limitada a símbolo/Magic, exposición residual, confirmaciones tardías, reconstrucción del enfriamiento y protección de operaciones ajenas. Los extremos MFE/MAE anteriores a una reinicialización no se reconstruyen.
-3. Compilar el fuente final en MetaEditor y contrastar advertencias; comprobar en el probador las correcciones de reintentos, reconciliación y diagnóstico de la versión conservada.
-4. Si se retoma la investigación, preparar comparaciones reproducibles y fuera de muestra, conservar binarios/entradas/informes y evaluar costes, calidad de datos y riesgo antes de extraer nuevas conclusiones.
+Se elige por simplicidad para estudiar las entradas; no se considera la variante ganadora ni validada.
 
-El experimento queda cerrado documentalmente con estos pendientes abiertos. Se conservan sin cambios el EA y la documentación existente. No se realizó commit ni push.
+### Material necesario
+
+- Informe y diario de una ejecución continua del 1 de enero al 1 de noviembre de2026 con esa configuración.
+- Si los registros no contienen suficientes campos, completar únicamente instrumentación, sin modificar decisiones de trading.
+
+### Preguntas a responder
+
+- MFE y MAE por idea, en USD y en R, con 1R igual al riesgo inicial calculado de esa idea tras normalizar precio y volumen.
+- Cuántas ideas alcanzaron +0.5R o +1R y terminaron con resultado negativo.
+- Distribución de resultados por mes, dirección y sesiones definidas antes de comparar. Para asignar sesiones, documentar hora del servidor y cambios de huso; no deducir hora de México solo desde el timestamp del log.
+- Si se comparan órdenes de eventos (por ejemplo, alcanzar +1R antes de −1R), registrar los instantes: los máximos MFE/MAE por sí solos no prueban ese orden.
+
+### Decisión de cierre
+
+Proponer una sola hipótesis si aparece un patrón repetido y con una explicación concreta. Evaluarla después en un período reservado que no se haya utilizado para diseñarla. Si no aparece, archivar esta familia y estudiar otra estrategia sin seguir agregando filtros por ensayo y error.
+
+## Estado operativo
+
+Los informes provienen de backtesting; el diario citado fue revisado, no se ejecutó aquí una nueva compilación o simulación. No se efectuaron operaciones reales ni se solicitó commit o push durante este cierre.
