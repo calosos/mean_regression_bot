@@ -97,3 +97,11 @@ void BeginClose(const string&) { state=CLOSING_IDEA; }
 
 void ObserveIdeaExcursions() {}
 void ResetExcursions() {}
+
+enum ReentryExitMode { EXIT_SMA20_DYNAMIC, EXIT_ATR_FIXED_2, EXIT_HALF_SMA20_DYNAMIC, EXIT_OPPOSITE_BAND_DYNAMIC, EXIT_HALF_SMA20_TRAIL_ATR };
+ReentryExitMode InpReentryExitMode=EXIT_SMA20_DYNAMIC;
+
+enum Strategy { ORIGINAL, BB_REENTRY, BB_WICK_REJECTION, ATR_DEVIATION_REENTRY };
+Strategy InpStrategy=ORIGINAL;
+
+#include "partial_legacy_mock.hpp"

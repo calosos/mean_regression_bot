@@ -21,4 +21,14 @@ int main(){
  detailed=false;logs.clear();SignalLog(1,candle,100.555,110.666,90.444,9.111,2.222);assert(logs.empty());
  detailed=true;InpSignalMode=INTRABAR;logs.clear();quote_reads=0;SignalLog(1,candle,100.555,110.666,90.444,9.111,2.222);assert(logs.size()==1 && quote_reads==0 && logs[0].find("modo=INTRABAR")!=string::npos && logs[0].find("evaluacion=")==string::npos);
  std::cout<<"PASS: actual log function with synthetic OHLC snapshots; all fields, 190802/3600/3600 second ages, distinct Bid/Ask vs Close, missing quote nonfatal, bool boundary, detailed-log toggle and unchanged intrabar output\n";
+
+ InpOscillator=RSI;
+ for(auto mode:{INTRABAR,CLOSED_BAR}){
+  InpSignalMode=mode;logs.clear();SignalLog(1,candle,100.555,110.666,90.444,29.123,2.222);
+  auto text=logs[0];assert(text.find("oscilador=RSI RSI=29.1230000000")!=string::npos);
+  assert(text.find(mode==INTRABAR ? "shift=0":"shift=1")!=string::npos);
+  assert(text.find("umbral_compra=30.0000000000 umbral_venta=70.0000000000")!=string::npos);
+  assert(text.find(" K=")==string::npos && text.find("STOCHASTIC")==string::npos);
+ }
+ std::cout<<"PASS: RSI trace contains selected name/value, shift, thresholds and no fictitious K\n";
 }

@@ -1,6 +1,6 @@
 # Mean Reversion EA — MVP para MetaTrader 5
 
-EA monolítico en `MeanReversionEA.mq5`, exclusivamente MQL5 y biblioteca estándar `Trade/Trade.mqh`. Implementa `SPEC_MVP.md`, incluidas las aclaraciones de su sección 16 y las variantes experimentales de su sección 17. `AGENTS.md` contiene las instrucciones del proyecto.
+EA monolítico en `MeanReversionEA.mq5`, exclusivamente MQL5 y biblioteca estándar `Trade/Trade.mqh`. Implementa `SPEC_MVP.md`, incluidas las aclaraciones de su sección 16 y las variantes experimentales de sus secciones 17–30. `AGENTS.md` contiene las instrucciones del proyecto.
 
 Solo permite inicializar dentro del **Probador de Estrategias de MT5**, en **XAUUSD M5** y con moneda de cuenta **USD**. No se adjunta a gráficos de cuentas reales ni demo: fuera del probador devuelve `INIT_FAILED`. Admite nombres de símbolo que contengan `XAUUSD`, incluidos prefijos/sufijos; no infiere equivalencias como `GOLD`.
 
@@ -21,6 +21,25 @@ No requiere DLL, Python, APIs, bases de datos, indicadores personalizados ni ser
 
 | Entrada | Valor predeterminado | Significado |
 | --- | --- | --- |
+| `InpStrategy` | ORIGINAL | ORIGINAL=0, BB_REENTRY=1, BB_WICK_REJECTION=2 o ATR_DEVIATION_REENTRY=3 |
+| `InpATRDeviationThreshold` | 1.5 | Umbral T finito y positivo, solo ATR_DEVIATION_REENTRY |
+| `InpWickMinRatio` | 0.40 | Mínima proporción mecha/rango; solo V6, 0 < ratio <= 1 |
+| `InpReentryBBWFilter` | false | Interruptor general BBW, solo BB_REENTRY |
+| `InpReentryBBWMode` | BBW_NON_INCREASING | V5A o BBW_BELOW_P70 (V5C), solo con filtro habilitado |
+| `InpReentryADXMode` | ADX_OFF | Enum ADX experimental exclusivo de BB_REENTRY, periodo fijo 14 |
+| `InpReentryMACDConfirm` | false | Confirmación MACD opcional exclusiva de BB_REENTRY |
+| `InpMACDFast` | 12 | Periodo rápido MACD, positivo y menor que Slow |
+| `InpMACDSlow` | 26 | Periodo lento MACD, positivo |
+| `InpMACDSignal` | 9 | Periodo de señal MACD, positivo |
+| `InpReentryWeekendGuard` | false | Protección semanal experimental exclusiva de BB_REENTRY |
+| `InpWeekendEntryBlockMinutes` | 60 | Bloquear entradas desde este margen antes del cierre semanal |
+| `InpWeekendCloseMinutes` | 30 | Solicitar WEEKEND_GUARD desde este margen |
+| `InpReentryExitMode` | EXIT_SMA20_DYNAMIC | Solo BB_REENTRY: modos de salida definidos, incluido parcial SMA20 + trailing ATR |
+| `InpReentrySLATR` | 3.0 | Multiplicador SL de las tres estrategias de una entrada; finito y >0, ignorado en ORIGINAL |
+| `InpOscillator` | STOCHASTIC | Enum: STOCHASTIC original o RSI experimental |
+| `InpRSIPeriod` | 14 | Periodo RSI M5, PRICE_CLOSE; solo al seleccionar RSI |
+| `InpRSIBuyLevel` | 30 | Compra si RSI es estrictamente menor |
+| `InpRSISellLevel` | 70 | Venta si RSI es estrictamente mayor |
 | `InpSignalMode` | INTRABAR | Enum: INTRABAR o CLOSED_BAR; ambas variantes son experimentales |
 | `InpMagicNumber` | 20261104 | Identidad de las operaciones del EA; debe ser única en el símbolo |
 | `InpRiskBaseUSD` | 25000 | Capital fijo de referencia en USD |
@@ -36,11 +55,294 @@ No requiere DLL, Python, APIs, bases de datos, indicadores personalizados ni ser
 | `InpDeviationPoints` | 20 | Desviación máxima solicitada, en puntos del símbolo |
 | `InpDetailedLogs` | true | Logs de señales y actualizaciones; errores, entradas y cierres esenciales permanecen visibles |
 
-Las distancias E2 = 1 ATR y SL = 3 ATR no son configurables. El ATR se congela desde la última vela cerrada. El presupuesto no depende del balance o equity actuales.
+En ORIGINAL, las distancias E2 = 1 ATR y SL = 3 ATR no son configurables. En BB_REENTRY solo existe E1, con SL = `InpReentrySLATR × ATR` (3 ATR predeterminado). El ATR se congela desde la última vela cerrada. El presupuesto no depende del balance o equity actuales.
 
-## Variantes experimentales de señal
+## ATR_DEVIATION_REENTRY: regreso en unidades ATR
 
-`InpSignalMode` es el único parámetro nuevo. `INTRABAR` conserva la variante original y continúa siendo el valor predeterminado. `CLOSED_BAR` es una variante de confirmación al cierre para comparar mediante backtesting; ninguna variante supone rentabilidad ni uso en producción.
+Nueva hipótesis experimental sin ventaja demostrada, valor3 del selector. Los valores anteriores0/1/2 y el predeterminado ORIGINAL permanecen. Usa **solo iMA SMA20 sobre Close y iATR14, ambos M5**, sin crear Bollinger ni osciladores/ADX/MACD. Ignora sus filtros, BBW, mechas e InpSignalMode. No intervienen en señal ni TP.
+
+`D=(Close−SMA20)/ATR14`, con datos de la misma vela cerrada shift1 y sin redondeo. `InpATRDeviationThreshold=1.5` define T y debe ser finito y positivo. D<−T prepara compra; D>T prepara venta. No entra todavía. Compra confirma en una vela posterior si −T<D<0; venta si0<D<T.
+
+Exteriores sucesivos del mismo lado mantienen la primera fecha y snapshot. El extremo opuesto sustituye preparación. Esperando compra, alcanzar/cruzar D0 descarta salvo que corresponda preparar venta exterior; análogo para venta. Igualdad con ±T no prepara ni confirma y conserva la preparación si no llegó a la media; D0 descarta. No hay vencimiento por velas ni condiciones sobre color/dirección de Close o movimiento del precio: un ATR mayor puede confirmar con Close sin cambio. Los cambios de Close/SMA/ATR se registran solo como diagnóstico.
+
+Consume al confirmar aunque riesgo/ejecución rechacen. No acumula durante actividad, cierres, enfriamiento, solicitudes o bloqueos. Al iniciar espera nueva vela; datos ausentes/invalidos y discontinuidades limpian y omiten, sin entrada tardía. Se verifica continuidad por aperturas M5, permitiendo primer tick unos segundos tarde. Si se saltan oportunidades M5, también omite la evaluación que encuentra el salto. Las señales tienen marcas ATRDEV propias.
+
+Reutiliza entrada única sin E2, ATR[1] congelado y SL desde ejecución real. **InpReentrySLATR aplica ahora a BB_REENTRY, BB_WICK_REJECTION y ATR_DEVIATION_REENTRY**, sin cambiar los comportamientos anteriores. La nueva estrategia usa InpATRMax configurable, predeterminado8. Volumen para una entrada con OrderCalcProfit, normalización, riesgo verificado antes/después y SL obligatorio. TP inicial y actualizaciones SMA20[1] del iMA propio, sin factor0.90; SL fijo. Conserva TP lógico/Bid/Ask, restricciones, cierre monetario, reintentos, propiedad/netting, reconciliación/EXIT_PENDING, enfriamiento, MFE/MAE y residuos.
+
+La protección semanal también aplica y limpia preparación. Configuración de investigación manual, sin optimización:
+
+```text
+InpStrategy=ATR_DEVIATION_REENTRY
+InpATRDeviationThreshold=1.5
+InpReentrySLATR=2.0
+InpATRMax=8
+InpRiskBaseUSD=25000
+InpRiskPercent=0.25
+InpReentryWeekendGuard=true
+InpWeekendEntryBlockMinutes=60
+InpWeekendCloseMinutes=30
+```
+
+Repetir por separado T=2.0,2.5,3.0 manteniendo lo demás. INIT registra parámetros efectivos y guard. PREPARATION registra dirección, fecha y primer Close/SMA/ATR/D; las sustituciones/limpiezas indican motivo. SIGNAL incluye evaluación, fechas y snapshots de preparación/confirmación, diferencias de Close/SMA/ATR y referencia de mercado separada; no filtra esas diferencias. Se conservan ENTRY/TP_UPDATE/EXIT.
+
+**Verificaciones ejecutadas:** pasan **19 tests auxiliares**, incluido nuevo escenario ATR de transiciones de ambos lados, igualdades, media/opuesto, primera preparación preservada, ATR creciente con Close inmóvil, shifts1, limpieza por datos/pausas/bloqueos y TP SMA sin Bollinger. Se ampliaron inicialización (solo iMA/ATR y umbrales), entrada real adaptada/riesgo/SL, guard semanal y formato de logs diagnósticos. Regresiones anteriores de señales, riesgo, PnL, propiedad y MFE/MAE pasan. Revisión estática realizada; **compilación MQL5 y backtesting pendientes**. Las pruebas extraen funciones MQL5 actuales con adaptadores C++, no ejecutan el compilador ni motor MT5. No se ha medido rentabilidad ni optimizado parámetros.
+
+## V6: BB_WICK_REJECTION
+
+Estrategia experimental de rechazo mediante mechas, sin ventaja demostrada. Se añade con valor **2**; ORIGINAL=0 y BB_REENTRY=1 conservan valores, comportamiento y predeterminado ORIGINAL. No necesita preparación exterior previa ni usa osciladores, ADX, MACD o BBW. Ignora esos parámetros e InpSignalMode. Solo crea Bollinger estándar M5 20/2.5 PRICE_CLOSE y ATR estándar M5 14.
+
+Evalúa una vez por nueva vela, exclusivamente OHLC/Bollinger de la recién cerrada [1]. Rango=High−Low; mecha inferior=min(Open,Close)−Low; superior=High−max(Open,Close). Compra si Low <= Lower, mecha inferior/rango >= InpWickMinRatio y cierre estrictamente entre ambas bandas; venta con High >= Upper y mecha superior/rango >= ratio, con el mismo cierre interior. Ratio predeterminado0.40, finito y positivo hasta1. Igualdad de ratio permite; igualdad del Close con una banda rechaza. No redondea proporciones.
+
+No exige color, Open dentro de bandas, tamaño de cuerpo, distancia mínima de cierre ni señal exterior anterior. Si cumple ambas direcciones, registra AMBIGUOUS_SIGNAL y descarta ambas. Rango cero u OHLC/Bollinger inválidos no operan. No imprime ausencia de señal cada vela.
+
+Reutiliza gestión de una entrada: ATR[1] congelado, lote/riesgo para esa entrada, SL configurable desde la ejecución real y TP inicial/dinámico SMA20[1]. **InpReentrySLATR ahora aplica a ambas estrategias de una entrada**; ORIGINAL conserva SL3ATR. V6 usa **InpATRMax configurable**, predeterminado8; BB_REENTRY conserva su límite8 anterior. Se mantiene verificación de riesgo normalizado/ejecutado, SL obligatorio, cierre monetario, TP lógico y reintentos.
+
+Señales identificadas por vela/dirección, consumidas aunque falle riesgo o ejecución. No acumula durante actividad, cierre, enfriamiento o bloqueos. Al iniciar espera nueva vela; exige continuidad de horas de apertura, permitiendo ticks unos segundos tarde. Descarta barras antiguas y datos faltantes sin ejecución retrospectiva. Las marcas WICK se separan de las otras estrategias. Mantiene propiedad/netting, solicitudes inciertas, reconciliación/EXIT_PENDING, MFE/MAE y limpieza de residuos.
+
+La protección semanal existente también aplica a V6 cuando se habilita; conserva sesiones, márgenes, bloqueo/cierre y limitaciones anteriores. Para probar, sin optimización:
+
+```text
+InpStrategy=BB_WICK_REJECTION
+InpWickMinRatio=0.40
+InpReentrySLATR=2.0
+InpATRMax=8
+InpRiskBaseUSD=25000
+InpRiskPercent=0.25
+InpReentryWeekendGuard=true
+InpWeekendEntryBlockMinutes=60
+InpWeekendCloseMinutes=30
+```
+
+INIT registra estrategia, ratio, SL y guard semanal. SIGNAL incluye hora de evaluación/vela, dirección, OHLC, bandas, SMA, ATR, rango, cuerpo, ambas mechas y sus proporciones, cuerpo/rango y distancia de Close desde la banda tocada dividida por ATR. Estas dos últimas métricas son **solo diagnóstico**. Cotización Bid/Ask y referencia E1 se registran aparte del Close, sin presentarlas como ejecución real. ENTRY/TP_UPDATE/EXIT y MFE/MAE se conservan.
+
+**Verificaciones ejecutadas:** 18 tests offline pasan, incluido un nuevo test guardado de V6 con ratio40%, igualdad de Close, Open exterior, ambos colores/doji, señal doble, rango/valores inválidos, shifts, no preparación, no duplicados/señales antiguas/tardías, bloqueo por actividad/enfriamiento. Se ampliaron ejecución real adaptada, inicialización y guard semanal para V6. Las regresiones de ORIGINAL/BB_REENTRY, propiedad, riesgo, reintentos, PnL y MFE/MAE siguen pasando. Son funciones extraídas con respuestas MT5 simuladas, no ejecución de bróker. Revisión estática realizada; **compilación MQL5 y backtesting pendientes** en MetaEditor/MT5. El entorno WSL previamente no pudo arrancar MetaEditor; se conserva la indicación de compilar por parte del usuario.
+
+## BB_REENTRY: una entrada y reingreso a Bollinger
+
+Seleccionar **`InpStrategy=BB_REENTRY`**. Es una hipótesis experimental sin rentabilidad demostrada. `ORIGINAL` sigue siendo el valor predeterminado y conserva sus combinaciones Stochastic/RSI e INTRABAR/CLOSED_BAR.
+
+| Aspecto | ORIGINAL | BB_REENTRY |
+| --- | --- | --- |
+| Señal | Extremo del oscilador + Bollinger según modo | Cierre exterior seguido de otro cierre estrictamente interior |
+| Evaluación | INTRABAR o CLOSED_BAR | Solo una vez por nueva vela, shift=1 |
+| Oscilador | Stochastic o RSI | Ninguno; no se crea su handle |
+| Entradas | E1 + E2 pendiente del mismo lote | Solo E1, sin pendientes E2 |
+| Riesgo teórico | Dos entradas, 5 ATR | Una entrada, InpReentrySLATR × ATR |
+| TP inicial | Factor desde banda exterior, datos [0] | SMA20[1] de confirmación |
+| TP posterior | Factor desde banda exterior, datos [1] | SMA20[1] de última vela cerrada |
+
+BB_REENTRY usa valores fijos: **Bollinger 20/2.5, PRICE_CLOSE; ATR 14 y máximo 8; M5**. La SMA20 es el buffer central de iBands, sin indicador adicional. No intervienen ni se validan `InpSignalMode`, `InpOscillator`, parámetros RSI/Stochastic, `InpBollingerPeriod`, `InpBollingerDeviation`, `InpATRPeriod`, `InpATRMax` ni `InpTPFactor`. Estas entradas siguen aplicando a ORIGINAL. Sí aplican capital/riesgo, Magic Number, desviación de ejecución y logs.
+
+Un cierre por debajo de la banda inferior prepara compra; por encima de la superior prepara venta. No entra en esa vela. El primer cierre posterior estrictamente entre ambas bandas confirma la dirección preparada, sin exigir nuevo toque. Una mecha exterior con cierre interior no prepara. Cierres exteriores del mismo lado mantienen la preparación y su vela inicial; un cierre exterior opuesto la sustituye. La igualdad con cualquier banda conserva la preparación sin confirmar. No hay vencimiento por número de velas.
+
+La preparación se consume al confirmar aunque se rechace riesgo/ejecución; se limpia al iniciar idea y enfriamiento. No se acumula durante actividad, cierre, solicitudes inciertas o bloqueos. Al iniciar/reiniciar está vacía y espera una nueva vela. Cada cierre debe ser contiguo a la nueva vela por sus horas de apertura (300 segundos); el primer tick puede llegar unos segundos tarde. Ante una barra antigua tras una pausa se limpia y omite esa evaluación. Si se saltan oportunidades M5, se limpia la secuencia anterior; solo la última barra contigua puede preparar una secuencia nueva. Datos ausentes limpian y descartan sin entrada retrospectiva.
+
+Congela ATR[1] de confirmación. El lote se calcula con OrderCalcProfit para una entrada hasta SL a `InpReentrySLATR × ATR`, con precios normalizados y volumen hacia abajo; vuelve a verificarse después de ejecutar E1. Por ejemplo, USD 25,000 al 0.25% son USD 62.50; con contrato de 100 onzas, ATR 2 y paso 0.01, con multiplicador 3.0 el lote de referencia es **0.10**, riesgo USD 60; con 2.0 es **0.15**, también USD 60. No usa el presupuesto de 5 ATR de ORIGINAL. Un fallo de riesgo o SL tras E1 inicia cierre persistente; no ajusta volumen ni desplaza SL.
+
+El objetivo inicial es SMA20[1] de confirmación, normalizado al tick, y se actualiza con SMA20[1] cada nueva vela en ambos sentidos. Compra comprueba Bid >= objetivo; venta Ask <= objetivo. Un objetivo ya alcanzado inicia cierre a mercado. El SL permanece fijo. Stops/freeze que impidan TP de servidor dejan un objetivo lógico por tick y los reintentos controlados comunes. Las lecturas pendientes de TP durante una idea pueden reintentarse; las evaluaciones de señal descartadas no se recuperan.
+
+Se conservan cierre monetario, criterio de costes, propiedad/netting, solicitudes inciertas, reconciliación/EXIT_PENDING, enfriamiento y MFE/MAE. El presupuesto no garantiza pérdida máxima frente a gaps o deslizamiento. Las explicaciones posteriores sobre E2, factor TP y osciladores corresponden a ORIGINAL; las protecciones y limitaciones compartidas aplican a ambas estrategias.
+
+Logs: `INIT estrategia=BB_REENTRY`; `PREPARATION` con dirección, vela, cierre y bandas; `PREPARATION_CLEAR` con motivo; `SIGNAL` con vela exterior inicial y de confirmación, cierre, bandas, SMA20, ATR y shift; `ENTRY` con ejecución real, lote, SL, TP, riesgo y multiplicador efectivo `SL_ATR`; INIT también incluye `SL_ATR`. Se conservan actualizaciones, rechazos y cierres con MFE/MAE.
+
+**Verificación:** suite offline de **22 tests**, incluidos escenarios del OnTick y OnInit reales extraídos del fuente y ejecución auxiliar de OpenIdea/SL/TP con respuestas MT5 simuladas. Cubre las 14 verificaciones de BB_REENTRY, validación solo de entradas pertinentes, ausencia de osciladores, una entrada sin E2, riesgo para multiplicadores 3.0/2.0 y su revisión tras ejecución, SL fijo, TP lógico/servidor, fallos y regresiones ORIGINAL/MFE/MAE/reconciliación. La revisión estática se distingue de estas simulaciones: no son compilación MQL5 ni backtesting.
+
+**Pendiente:** compilar esta versión con F7 en MetaEditor y validar en el Probador. Se mantiene la indicación del usuario de compilar por su cuenta; la invocación local anterior falló por interoperabilidad WSL y no hay resultado de compilación para esta versión. No se ejecutó backtesting ni optimización.
+
+Para comparar SL, ejecutar dos backtests con idénticos datos y parámetros, cambiando únicamente `InpReentrySLATR=3.0` por `2.0`. El multiplicador debe ser finito y positivo, se valida solo en BB_REENTRY y se utiliza tanto para calcular el volumen previo como para establecer el SL desde el precio real. El volumen se redondea hacia abajo y se verifica el riesgo tras normalizar y ejecutar; si falla, se aborta y gestiona el cierre. Se mantiene `InpRiskPercent=0.25`, sin modificar señal, ATR congelado, entrada única, TP, enfriamiento ni protecciones. Las regresiones auxiliares para ambos multiplicadores pasan; compilación MQL5 y backtesting de esta versión siguen pendientes.
+
+Para probar: `InpStrategy=BB_REENTRY`, `InpRiskBaseUSD=25000`, `InpRiskPercent=0.25`; M5, ticks reales, cuenta USD y optimización desactivada. Inspeccionar preparación, confirmación, una sola entrada, ausencia de E2, SL fijo y cambios del objetivo SMA20 en el Diario y modo visual. Repetir con ORIGINAL y su configuración anterior para contrastar la regresión operativa.
+
+### EXIT_HALF_SMA20_TRAIL_ATR: 50% en SMA20 y trailing del remanente
+
+Nueva opción experimental **4** de `InpReentryExitMode`, exclusiva de BB_REENTRY. Valores0..3 y predeterminado0 no cambian. El nombre HALF se refiere al **volumen**, no a media distancia a SMA20.
+
+Antes del parcial, el objetivo lógico es **SMA20[1]**, actualizado cada nueva vela M5. No se instala TP de posición que liquide todo el volumen. Compra activa cuando Bid>=SMA y venta cuando Ask<=SMA. Mantiene la entrada única, SL inicial, ATR congelado, riesgo y filtros anteriores.
+
+Al alcanzar, cierra50% del volumen inicial en pasos enteros, hacia abajo:0.15 con paso0.01 implica cerrar0.07 y dejar0.08. Ambos deben cumplir mínimo/paso; si no, registra PARTIAL_NOT_POSSIBLE y cierra toda la idea mediante la gestión común. No espera que el precio vuelva al objetivo tras un rechazo: conserva la solicitud activada para reintentar cuando proceda.
+
+El parcial usa un deal contrario dirigido al ticket (`MqlTradeRequest.position`), compatible con [hedging y netting](https://www.mql5.com/en/docs/constants/structures/mqltraderequest), con controles de símbolo/Magic/identificador/volumen. No abre una segunda entrada ni añade pendientes. La [herencia de SL/TP de MT5](https://www.metatrader5.com/en/terminal/help/trading/general_concept) conserva las protecciones durante un parcial; además el EA exige SL válido y TP0. Siguen aplicando exclusividad netting y protección de posición mezclada.
+
+**No activa trailing solo por un código de éxito o cambio de volumen:** exige orden terminal, todos sus deals y volumen reconciliado. Identifica cada intento por comentario único y recuerda sus órdenes. Duplicados y eventos atrasados no repiten el parcial. Ante ejecución IOC incompleta solicita solo la diferencia tras reconciliar; si no es negociable, cierra todo. Un resultado incierto conserva bloqueo, sin liberarlo por tiempo. Si no aparece identidad/historial suficiente, puede requerir intervención; se mantiene la protección y no se inventa una ejecución fallida para reenviar.
+
+Tras confirmar el parcial, inicia el seguimiento con Bid/Ask vigente entonces, sin precios previos ni MFE. Compra: SL candidato=máximo Bid observado−1 ATR de entrada; venta: mínimo Ask observado+1 ATR de entrada. Observa por tick, normaliza al tick y solo mejora SL, respetando stops/freeze. No aplica breakeven independiente. Mantiene SL vigente durante rechazos y acredita cambios solo al confirmarlos en la posición. El remanente queda sin TP y no vuelve a actualizar SMA ni enviar otro parcial.
+
+La idea continúa activa y MFE/MAE no se reinician. El PnL definitivo suma parcial y remanente con los costes ya reconciliados. Cierre monetario/semanal conserva prioridad; si hay solicitud parcial incierta o volumen sin conciliar, se espera su resolución antes de solapar otro cierre de la misma posición. EXIT/EXIT_PENDING y enfriamiento solo concluyen al completar toda la exposición y solicitudes. Reiniciar mantiene la limpieza de residuos anterior, sin reconstruir un trailing histórico.
+
+Logs: INIT/ENTRY con modo; TP_UPDATE para objetivo previo; PARTIAL_TARGET, PARTIAL_REQUEST, PARTIAL_PENDING, PARTIAL_REJECTED, PARTIAL_CONFIRMED con restante; TRAIL_UPDATE para SL confirmado; PARTIAL_NOT_POSSIBLE para cierre completo. Las esperas no generan solicitudes duplicadas ni logs idénticos por tick.
+
+Para probar: BB_REENTRY y `InpReentryExitMode=EXIT_HALF_SMA20_TRAIL_ATR`, manteniendo los demás parámetros y datos. Es una hipótesis sin ventaja demostrada; no se optimizó.
+
+**Verificaciones ejecutadas:** pasan **22 tests auxiliares**, con dos escenarios nuevos guardados. Se prueban funciones reales de división/envío/reconciliación/trailing con respuestas simuladas: compra/venta, payload dirigido a posición para ambos modelos, división impar o inválida, TP servidor0, rechazo con control de reintentos, resultado incierto recuperado por comentario, deals/volumen atrasados, callbacks duplicados, IOC parcial, orden no terminal, SL concurrente, identidad/propiedad, extremo desde confirmación, ATR congelado, SL sin aflojar, errores y confirmación tardía de SL y PnL parcial+remanente. OnTick real con colaboradores simulados verifica encaminamiento al parcial y prioridad monetaria. Las regresiones anteriores de cierre/netting/reintentos/PnL/MFE/MAE siguen pasando.
+
+**Pendiente:** compilación MQL5 en MetaEditor y backtesting MT5 con cuenta de prueba hedging/netting. Las pruebas compilan fragmentos en C++, sin terminal ni servidor real, y no acreditan esas verificaciones. La interoperabilidad WSL previamente impidió arrancar MetaEditor. No se hicieron operaciones reales, commit ni push.
+
+### Salida EXIT_OPPOSITE_BAND_DYNAMIC
+
+Seleccionar `InpStrategy=BB_REENTRY` y `InpReentryExitMode=EXIT_OPPOSITE_BAND_DYNAMIC`. La nueva opción vale **3**; se conservan 0=SMA20 dinámica (predeterminado), 1=ATR fijo2 y 2=media distancia SMA20 dinámica. Las otras estrategias ignoran el selector.
+
+Compra fija el objetivo en **UpperBand[1]**; venta en **LowerBand[1]**, usando el iBands existente y sus parámetros actuales. El TP inicial utiliza el snapshot cerrado de la señal y se establece **después de confirmar la ejecución real de E1**. Cada nueva vela M5 se recalcula con shift1, normalizado al tick, permitiendo cambios en ambos sentidos. No usa la vela en formación ni InpTPFactor.
+
+Compra cierra si Bid >= objetivo y venta si Ask <= objetivo. Si ya está alcanzado al asignar o actualizar, inicia cierre a mercado. Mantiene TP lógico y reintentos si stops/freeze o rechazos del servidor impiden asignarlo, con SL obligatorio e inmóvil. INIT/ENTRY identifican el modo y se conserva TP_UPDATE.
+
+Entrada, riesgo/volumen, ATR congelado, SL, filtros, guard semanal, enfriamiento, propiedad/netting, reconciliación y MFE/MAE no cambian. Hipótesis experimental sin ventaja demostrada; comparar cambiando solo el selector, sin optimización.
+
+**Verificaciones ejecutadas:** pasan los **20 tests auxiliares ampliados**, con TP inicial superior/inferior, normalización, objetivo ya alcanzado al abrir, fallback/reintento conservando SL, actualizaciones de shift1 en ambos sentidos y cierre al alcanzar el nuevo objetivo. Se mantienen regresiones de las tres salidas anteriores y de otras estrategias. Revisión estática realizada. **Compilación MQL5 y backtesting de esta versión pendientes** en MetaEditor/MT5; los tests C++ con respuestas simuladas no equivalen a esas verificaciones.
+
+### Salida EXIT_HALF_SMA20_DYNAMIC
+
+Nueva opción exclusiva de BB_REENTRY: `EXIT_HALF_SMA20_DYNAMIC=2`. Los valores anteriores permanecen `EXIT_SMA20_DYNAMIC=0` (predeterminado) y `EXIT_ATR_FIXED_2=1`; sus comportamientos no cambian.
+
+Para compras y ventas: **TP = E1 ejecutada + 0.50 × (SMA20[1] − E1 ejecutada)**, normalizado al tick. El TP inicial se calcula después de conocer el precio real de E1. En cada nueva vela se recalcula con SMA20[1], conservando E1 fija durante toda la idea. No se calcula desde Bid/Ask actuales ni se aplica InpTPFactor.
+
+Compra cierra si Bid >= objetivo; venta si Ask <= objetivo. Si el objetivo recalculado ya está alcanzado, inicia cierre a mercado. Mantiene objetivo lógico y reintentos de sincronización ante restricciones del bróker, sin tocar SL. INIT/ENTRY registran el modo y se conserva TP_UPDATE. Señal, entrada única, lotaje/riesgo, ATR congelado, SL, cierre monetario/semanal, propiedad, enfriamiento, reconciliación y MFE/MAE permanecen iguales. Las otras estrategias ignoran el selector.
+
+Para comparar con las salidas anteriores, mantener BB_REENTRY y todos los demás parámetros/datos y cambiar solo `InpReentryExitMode=EXIT_HALF_SMA20_DYNAMIC`. Hipótesis experimental sin ventaja demostrada; sin optimización.
+
+**Verificación ejecutada:** pasan **20 tests auxiliares**, con nuevo escenario de OnTick/Target reales para actualización desde shift1, E1 fija distinta de cotización actual, ambas direcciones, SL intacto y cierre al alcanzar el nuevo objetivo. También se amplía OpenIdea real adaptado para usar el fill, recuperación de TP rechazado, TP_UPDATE y aislamiento de otras estrategias. Se conservan las regresiones SMA completa/ATR fijo, guard semanal, PnL y MFE/MAE. Revisión estática realizada; **compilación MQL5 y backtesting pendientes** en MetaEditor/MT5. Las compilaciones C++ auxiliares no acreditan compilación MQL5 ni ejecución real del EA.
+
+### S3: TP fijo a 2 ATR desde la ejecución real
+
+`InpReentryExitMode` es exclusivo de BB_REENTRY. `EXIT_SMA20_DYNAMIC` sigue predeterminado y conserva la salida anterior; **`EXIT_ATR_FIXED_2`** selecciona S3 experimental. Las otras estrategias ignoran el selector.
+
+S3 mantiene exactamente señales y validaciones de entrada. Tras ejecutar E1, fija el TP normalizado al tick: compra **E1 real + 2 × ATR congelado**, venta **E1 real − 2 × ATR congelado**. Usa el ATR de confirmación ya congelado, sin cotización solicitada, ATR posterior, SMA ni factor0.90. No cambia con velas nuevas. No añade trailing, breakeven, cierres parciales ni otras salidas.
+
+Con SL de 2 ATR, las distancias nominales son 1:1 antes de redondeos/ejecución; **no es garantía de relación monetaria exacta**. El lote continúa calculándose desde SL y presupuesto de riesgo, sin intervención del TP. El SL válido sigue siendo obligatorio.
+
+Reutiliza objetivo lógico por Bid/Ask, stops/freeze y reintentos: si el servidor rechaza TP, conserva supervisión y puede sincronizarlo después, sin mover SL ni enviar modificaciones redundantes. Las ventanas monetarias y semanales siguen activas, así como propiedad/netting, enfriamiento, reconciliación, EXIT_PENDING y MFE/MAE. La supervisión durante WEEKEND_GUARD tampoco recalcula un objetivo fijo.
+
+INIT incluye salida efectiva. ENTRY incluye modo, E1 real, ATR congelado, lote, SL/TP normalizados y riesgo. S3 usa `TP_SYNC` para sincronización con servidor; no registra cambios de objetivo por nuevas velas. Las explicaciones de SMA20 dinámica en BB_REENTRY corresponden al modo predeterminado; V6 y ATR_DEVIATION_REENTRY conservan sus salidas SMA.
+
+Configuración de prueba, sin optimización:
+
+```text
+InpStrategy=BB_REENTRY
+InpReentryExitMode=EXIT_ATR_FIXED_2
+InpReentrySLATR=2.0
+InpRiskBaseUSD=25000
+InpRiskPercent=0.25
+InpReentryADXMode=ADX_OFF
+InpReentryMACDConfirm=false
+InpReentryBBWFilter=false
+InpReentryWeekendGuard=true
+InpWeekendEntryBlockMinutes=60
+InpWeekendCloseMinutes=30
+```
+
+**Verificaciones ejecutadas:** pasan **19 tests auxiliares ampliados**: TP compra/venta desde fill distinto de Bid/Ask inicial, tick de 0.05, ATR congelado, ausencia de lecturas/recalculo del objetivo cuando cambian SMA/ATR, fallback y sincronización sin alterar SL, ausencia de modificaciones redundantes, logs TP_SYNC, cierres monetario y semanal, salida dinámica y estrategias ajenas al selector. Los tests de gestión/reconciliación/MFE/MAE siguen pasando. Revisión estática realizada. **Compilación MQL5 y backtesting pendientes** en MetaEditor/MT5; la ejecución C++ con adaptadores no los sustituye. No hay ventaja estadística demostrada.
+
+### V5A: filtro experimental BBW
+
+`InpReentryBBWFilter=true` exige **BBW[1] <= BBW[2]** en el primer cierre de reingreso estrictamente interior. `BBW[i]=(Upper[i]-Lower[i])/SMA[i]`, usando el iBands existente y la SMA de cada vela, exclusivamente las dos últimas cerradas. Igualdad permite; aumento rechaza. No se redondea antes de comparar. La variante V5C, descrita a continuación, es una alternativa. No se implementa V5B.
+
+Valida lecturas completas, números finitos, SMA positiva, bandas ordenadas y cocientes finitos. Rechazo o datos incompletos/invalidos consumen la preparación y exigen otra exterior, sin entrada tardía. No afecta posiciones ya abiertas ni ORIGINAL. Con false conserva la operativa anterior sin leer BBW[2]. ADX y MACD permanecen disponibles; si se combinan, todos deben permitir el mismo reingreso mediante AND. Las combinaciones quedan fuera de esta prueba.
+
+Configuración de prueba, sin optimización:
+
+```text
+InpStrategy=BB_REENTRY
+InpReentryBBWFilter=true
+InpReentryADXMode=ADX_OFF
+InpReentryMACDConfirm=false
+InpReentrySLATR=2.0
+InpReentryWeekendGuard=true
+InpWeekendEntryBlockMinutes=60
+InpWeekendCloseMinutes=30
+InpRiskBaseUSD=25000
+InpRiskPercent=0.25
+```
+
+INIT registra activación. BBW_FILTER registra dirección, fechas de ambas velas, sus bandas y SMA, BBW1/BBW2 con 17 dígitos significativos, resultado y motivo; datos ausentes se indican n/a. Sin repetición por tick. Esta hipótesis experimental no tiene ventaja demostrada; el resto de la gestión se mantiene.
+
+**Verificaciones ejecutadas:** pasan los 17 tests auxiliares guardados y ampliados: disminución/igualdad/aumento en ambas direcciones, SMA distinta por vela, shifts cerrados, aumento diminuto sin redondeo, datos incompletos/invalidos sin ejecución tardía, filtro apagado y aislamiento de la gestión. Revisión estática realizada. Compilación MQL5 y backtesting siguen pendientes en MetaEditor/MT5; el entorno WSL previamente no pudo arrancar MetaEditor. No se han optimizado parámetros ni probado rentabilidad.
+
+### BBW V5C: referencia P70
+
+El interruptor sigue siendo `InpReentryBBWFilter=false`. Para comparar, mantener iguales datos y demás parámetros y ejecutar:
+
+| Variante | Configuración | Regla |
+| --- | --- | --- |
+| Sin filtro | InpReentryBBWFilter=false | Modo ignorado |
+| V5A | true y BBW_NON_INCREASING | BBW[1] <= BBW[2] |
+| V5C | true y BBW_BELOW_P70 | BBW[1] < P70 |
+
+`InpReentryBBWMode=BBW_NON_INCREASING` sigue predeterminado. Los modos son alternativos, no se acumulan. V5C calcula la referencia con **exactamente BBW[2..101]**, 100 velas anteriores a la señal. Cada cociente usa su propia SMA y bandas. Ordena ascendentemente una copia y toma **índice 69**, el elemento 70; sin interpolación ni redondeo. BBW[1] es solo el valor de señal, nunca se incluye en la referencia. Igualdad con P70 rechaza.
+
+Valida los 101 cocientes, disponibilidad y fechas, finitud, SMA positiva y Upper >= Lower. No utiliza shift0/futuro ni añade continuidad obligatoria al histórico de referencia. Rechazos o datos insuficientes consumen la preparación sin entrada tardía. Los filtros MACD/ADX activos siguen combinándose mediante AND, sin modificar su configuración. ORIGINAL, gestión y filtro desactivado permanecen iguales.
+
+INIT registra el modo efectivo; apagado indica OFF. V5C registra vela de señal, BBW1, fechas de inicio (shift101) y fin (shift2) de la referencia, valores=100, P70, resultado y motivo. Si faltan datos, informa el número obtenido, los 100 requeridos y n/a para el percentil no calculado. No repite por tick.
+
+Para la prueba anterior, cambiar solo el modo BBW a `BBW_BELOW_P70`; conservar ADX_OFF, MACD false, SL2, guard60/30 y riesgo 0.25% de USD25000. Hipótesis experimental sin ventaja demostrada. No se añade V5B ni otro umbral y no se ejecuta optimización automática.
+
+**Verificación ejecutada:** pasan los 17 tests auxiliares guardados y ampliados: referencia desordenada con distinción entre puestos69/70, igualdad, exclusión de señal, lectura exacta2..101, SMA distinta por vela, alternativas no acumulativas, datos insuficientes/invalidos en shifts2/51/101 sin entrada tardía, V5A y filtro apagado. Revisión estática realizada; compilación MQL5 y backtesting de esta versión pendientes en MetaEditor/MT5.
+
+### Filtro ADX experimental
+
+`InpReentryADXMode` permite comparar cuatro modos predefinidos. Es una hipótesis experimental sin ventaja demostrada; **ADX bajo no garantiza lateralidad**.
+
+| Modo | Condición en el primer reingreso interior |
+| --- | --- |
+| ADX_OFF | Predeterminado, conserva comportamiento anterior |
+| ADX_BELOW_25 | ADX[1] < 25 |
+| ADX_BELOW_20 | ADX[1] < 20 |
+| ADX_BELOW_25_FALLING | ADX[1] < 25 y ADX[1] < ADX[2] |
+
+Usa [iADX estándar](https://www.mql5.com/en/docs/indicators/iadx), periodo fijo 14, símbolo del EA y M5, exclusivamente MAIN_LINE (buffer 0), sin DI ni iADXWilder. Solo crea/libera el handle con BB_REENTRY y ADX activo. Comparaciones estrictas, iguales para compras/ventas: igualdad con el umbral o entre ADX[1]/ADX[2] en FALLING rechaza. No usa shift=0. ADX[2] solo se lee en FALLING.
+
+El filtro se evalúa únicamente en el primer cierre posterior estrictamente interior, consumiendo la preparación incluso si rechaza o faltan datos; se exige otra preparación exterior, sin esperar ni ejecutar retrospectivamente. No cierra ni modifica posiciones por cambios posteriores del ADX. ORIGINAL y el resto de la gestión permanecen iguales. MACD conserva su selector: si ambos están activos, ambos deben permitir el mismo reingreso mediante AND, combinación fuera de esta prueba.
+
+Configuración para las cuatro ejecuciones, sin optimización automática:
+
+```text
+InpStrategy=BB_REENTRY
+InpReentryMACDConfirm=false
+InpReentrySLATR=2.0
+InpReentryWeekendGuard=true
+InpWeekendEntryBlockMinutes=60
+InpWeekendCloseMinutes=30
+InpRiskBaseUSD=25000
+InpRiskPercent=0.25
+```
+
+Cambiar solo `InpReentryADXMode` entre los cuatro valores y conservar los demás parámetros/datos. Los valores predeterminados globales de SL y protección semanal no cambian.
+
+INIT incluye modo ADX, periodo 14 y estado MACD. ADX_FILTER registra dirección, vela de reingreso, modo, ADX1, ADX2 cuando corresponde, resultado y motivo; datos no disponibles se marcan n/a. Con OFF no se consultan ni registran valores ADX ficticios. Sin repetición por tick.
+
+**Verificación:** los 17 tests auxiliares guardados se ampliaron para todos los modos, ambas direcciones, igualdades, descenso simultáneo al umbral, shifts/buffer, consumo de rechazo/datos incompletos sin ejecución tardía, creación condicional, OFF/ORIGINAL, aislamiento de la gestión y AND con MACD. Revisión estática realizada. Compilación MQL5 y backtesting pendientes en MetaEditor/MT5; no se acredita ventaja estadística.
+
+### Confirmación MACD experimental opcional
+
+Para probar: `InpStrategy=BB_REENTRY`, `InpReentryMACDConfirm=true`, periodos `12/26/9` y `InpReentrySLATR=2.0`. Mantener iguales el riesgo, TP y parámetros de protección semanal para comparar; no optimizar. Es una hipótesis experimental sin rentabilidad demostrada.
+
+Se utiliza [iMACD estándar](https://www.mql5.com/en/docs/indicators/imacd), M5 y PRICE_CLOSE. El handle se crea/libera solo cuando la confirmación está habilitada en BB_REENTRY. Solo entonces se validan periodos positivos y Fast < Slow. ORIGINAL ignora el filtro y sus periodos.
+
+**H = MAIN_LINE − SIGNAL_LINE** (buffers 0 y 1); H no son las barras MAIN_LINE que muestra MT5. En el primer cierre posterior estrictamente dentro de Bollinger, compra exige `H[1] < 0 && H[1] > H[2]`; venta exige `H[1] > 0 && H[1] < H[2]`. Solo velas cerradas, sin cruces, divergencias ni otra condición. Se consume la preparación tanto al confirmar como al rechazar; datos MACD ausentes también la descartan, sin reintentos tardíos. Después se exige una nueva preparación exterior.
+
+INIT registra configuración efectiva. `MACD_CONFIRM` incluye dirección, velas exterior/reingreso, MAIN1, SIGNAL1, H1, H2 y resultado; si el snapshot no está completo aparecen n/a y el motivo, sin inventar valores. No se repite por tick. Con false no se lee MACD ni cambia la señal anterior. Las referencias anteriores a ausencia de indicadores adicionales admiten este MACD y el filtro ADX opcionales.
+
+Los tests están guardados en test/: ambas direcciones, igualdades estrictas, buffers/shifts, consumo de rechazo y datos incompletos, ausencia de entradas tardías, periodos/handle condicionales y regresión desactivada. Pasan los **17 tests auxiliares** existentes ampliados. Revisión estática realizada; compilación MQL5 y backtesting de esta versión pendientes en MetaEditor/MT5. No cambian la entrada única, gestión, protección semanal ni métricas.
+
+### Protección experimental de cierre semanal
+
+Para probarla, seleccionar `InpStrategy=BB_REENTRY` y **`InpReentryWeekendGuard=true`**, con `InpWeekendEntryBlockMinutes=60` e `InpWeekendCloseMinutes=30`. Se valida `bloqueo >= cierre > 0` únicamente cuando la protección está habilitada en BB_REENTRY. El valor predeterminado false conserva el comportamiento anterior; ORIGINAL ignora estos parámetros.
+
+El EA lee las sesiones semanales del símbolo con [SymbolInfoSessionTrade](https://www.mql5.com/en/docs/marketinformation/symbolinfosessiontrade), en hora del servidor. Une sesiones solapadas o contiguas, admite múltiples sesiones, cruces de medianoche y final 00:00. Trata una sesión válida 00:00–00:00 como un día completo y rechaza iguales no nulos por duración ambigua. No utiliza hora local ni una hora de viernes fija.
+
+Solo considera identificable el descanso si existe **una única interrupción superior a 24 horas** en el patrón semanal unido. Las pausas diarias no bloquean entradas. Horarios 24/7, varias interrupciones extensas, datos ausentes o errores de lectura producen `WEEKEND_SCHEDULE_ERROR`: se limpian preparaciones y se bloquean entradas, conservando la gestión normal de posiciones existentes. No se inventa un cierre ni se fuerza la salida por un horario desconocido. Esta identificación es deliberadamente conservadora: horarios que no cumplan el criterio requieren revisión, no una suposición automática.
+
+Desde el margen de bloqueo (inclusive) descarta nuevas señales y limpia la preparación; desde el de cierre inicia `CLOSING_IDEA` con motivo `WEEKEND_GUARD`. Usa CloseStep, sus reintentos y protección de propiedad/netting. Mientras quede exposición continúa supervisando riesgo, SL y objetivo SMA20, dando prioridad a los intentos de cierre. Conserva reconciliación, EXIT_PENDING, PnL, MFE/MAE y enfriamiento. No agrega pendientes ni cambia el lotaje o el SL.
+
+El bloqueo dura hasta la siguiente sesión semanal. Al liberar, deja preparación NONE y omite la vela anterior al primer evento de desbloqueo; además conserva la continuidad M5. Una salida pendiente sigue en CLOSING_IDEA. Si no hubo eventos antes del cierre y una idea sobrevive hasta la reapertura, registra el incumplimiento del cierre conocido y continúa con el cierre WEEKEND_GUARD.
+
+Logs esenciales, sin repetición por tick: `INIT` con activación/márgenes; `WEEKEND_SCHEDULE` con fechas de cierre/reapertura y cambios; `WEEKEND_SCHEDULE_ERROR`; `WEEKEND_BLOCK_START/END`; `EXIT_REQUEST ... WEEKEND_GUARD`; errores de cierre y `WEEKEND_EXPOSURE` si llega el cierre previsto con exposición. Se aplica durante la inicialización, sin reconstruir señales históricas.
+
+**Limitaciones:** las sesiones son un patrón semanal del bróker, no un calendario completo de festivos ni garantía de horarios históricos o cierres extraordinarios. No se puede acreditar desde esta API que el patrón esté completo o vaya a respetarse. Un cierre adelantado, rechazos o ausencia de ticks pueden impedir quedar sin exposición. La consulta se renueva al iniciar y como máximo cada minuto del servidor; los límites conocidos se comprueban en cada tick. No hay temporizador que sustituya eventos ausentes ni otros filtros horarios.
+
+**Verificación:** pasan **17 tests offline**, incluida la lectura y unión de sesiones simuladas, pausas diarias, límites exactos, bloqueo/limpieza, reapertura, exposición residual, horarios cambiantes, sesiones múltiples/nocturnas y medianoche, semanas, fallos y aislamiento de ORIGINAL/desactivada. La ruta WEEKEND_GUARD se prueba con OnTick y supervisión reales y respuestas simuladas; los reintentos/protección, PnL y MFE/MAE mantienen sus regresiones propias. CloseStep, reconciliación, medición, señal, riesgo, lotaje, SL y TP comunes permanecen sin cambios. **No son compilación MQL5 ni backtesting MT5**. Quedan pendientes compilar en MetaEditor (el entorno WSL previamente no pudo arrancarlo) y probar con las sesiones reales del símbolo, guardando Diario e informe; sin optimización ni operaciones reales.
+
+## ORIGINAL: variantes experimentales de señal
+
+`InpSignalMode` selecciona la oportunidad de evaluación, independientemente de `InpOscillator`. `INTRABAR` conserva la variante original y continúa siendo el valor predeterminado. `CLOSED_BAR` es una variante de confirmación al cierre para comparar mediante backtesting; ninguna variante supone rentabilidad ni uso en producción.
 
 | Aspecto | INTRABAR | CLOSED_BAR |
 | --- | --- | --- |
@@ -65,9 +367,35 @@ La regresión `INTRABAR` pasó señales inmediatas incluso con Close fuera de ba
 
 Para comparar, ejecutar dos backtests con idénticos símbolo, fechas, ticks reales, cuenta y parámetros; cambiar solamente `InpSignalMode`. Revisar `SIGNAL modo=... vela=...`, entradas, rechazos por datos y salidas. La diferencia de resultados entre variantes no sustituye la verificación funcional de cada una.
 
+### Selección experimental de RSI
+
+`InpOscillator=STOCHASTIC` conserva las señales originales %K <10 / >90 y sus parámetros 14,3,3. `InpOscillator=RSI` usa el indicador estándar [iRSI](https://www.mql5.com/en/docs/indicators/irsi) del símbolo del EA, M5 y PRICE_CLOSE. RSI es una hipótesis experimental sin rentabilidad demostrada.
+
+Para probar **RSI 14, 30/70 con CLOSED_BAR**, configurar:
+
+```text
+InpOscillator=RSI
+InpRSIPeriod=14
+InpRSIBuyLevel=30
+InpRSISellLevel=70
+InpSignalMode=CLOSED_BAR
+```
+
+Compra si RSI <30; venta si RSI >70. RSI igual a 30 o 70 no cumple el extremo correspondiente. No se exigen cruces, pendientes ni divergencias. En INTRABAR se usa RSI[0]; en CLOSED_BAR, RSI[1], manteniendo toque Bollinger y cierre estrictamente dentro de ambas bandas en la misma vela. La tabla anterior describe STOCHASTIC; para RSI se sustituye únicamente su condición %K por estos umbrales.
+
+Solo se crea el handle seleccionado y solo se validan sus parámetros. RSI exige periodo >0 y niveles finitos con `0 < compra < venta < 100`. Los parámetros Stochastic no afectan RSI ni sus señales. El lector comprueba CopyBuffer, números válidos y EMPTY_VALUE. Se conserva el descarte/relectura de datos faltantes según el modo, las pausas, ATR[1], TP inicial[0], TP posterior[1] y toda la gestión y medición MFE/MAE. Las marcas persistidas RSI se separan de Stochastic y por modo; las claves Stochastic anteriores se conservan.
+
+`INIT` registra el oscilador y sus parámetros efectivos. `SIGNAL` incluye `oscilador=RSI RSI=... shift=0|1 umbral_compra=... umbral_venta=...`; con Stochastic utiliza `oscilador=STOCHASTIC K=...`. Se conservan modo, vela y los campos OHLC/Bollinger/ATR/mercado existentes; no se registra RSI como K ni valores del indicador no utilizado. Las referencias a %K de la explicación de pausas se entienden como RSI cuando está seleccionado. No se añade interfaz gráfica.
+
+Para comparar osciladores, repetir el backtest con idénticos datos, modo, riesgo y gestión, cambiando únicamente `InpOscillator`; mantener los parámetros predeterminados de cada oscilador. No optimizar parámetros.
+
+**Verificación de RSI:** revisión estática de sintaxis y lógica y suite offline ejecutada con fragmentos actuales del EA y respuestas MT5 simuladas. Se comprobaron ambos extremos y sus igualdades, umbrales configurables, shifts 0/1 con valores opuestos, independencia de Stochastic, deduplicación, ATR[1], datos faltantes y etiquetas de logs. Las regresiones existentes de Stochastic, gestión, riesgo, reintentos, reconciliación y MFE/MAE siguen pasando. No se modificaron las funciones de gestión ni medición.
+
+**Compilación de esta versión:** pendiente de ejecutar por el usuario en MetaEditor; el intento local no arrancó por el error de interoperabilidad WSL indicado arriba. **Backtesting MT5:** no ejecutado. Las pruebas C++ auxiliares no acreditan compilación MQL5 ni ejecución en MT5.
+
 ### Trazabilidad de CLOSED_BAR y evaluación después de pausas
 
-El registro ampliado conserva una sola línea `SIGNAL` por señal aceptada para su evaluación de ejecución; no añade un registro por tick ni vuelve a consultar indicadores. Usa el mismo `MqlRates` de `CopyRates(...,1,1,...)`, bandas/SMA20[1], %K[1] y ATR[1] que se pasaron a la decisión. Las bandas de shift=0 para el TP inicial no se mezclan con los campos de la señal. El formato anterior de `INTRABAR` se conserva.
+El registro ampliado conserva una sola línea `SIGNAL` por señal aceptada para su evaluación de ejecución; no añade un registro por tick ni vuelve a consultar indicadores. Usa el mismo `MqlRates` de `CopyRates(...,1,1,...)`, bandas/SMA20[1], %K[1] y ATR[1] que se pasaron a la decisión. Las bandas de shift=0 para el TP inicial no se mezclan con los campos de la señal. Ambos formatos incluyen ahora oscilador, valor, shift y umbrales efectivos.
 
 Formato de la nueva línea, mostrado dividido únicamente para facilitar la lectura (los puntos suspensivos son campos pendientes, no datos históricos):
 
@@ -76,7 +404,7 @@ SIGNAL <fecha_publicacion> idea=<id_previo> modo=CLOSED_BAR
  evaluacion=<fecha_hora> vela=<apertura_vela_senal>
  cierre_nominal=<apertura_vela_senal+300s> segundos_desde_cierre=<segundos>
  direccion=<BUY|SELL> Open=... High=... Low=... Close=...
- LowerBand=... SMA20=... UpperBand=... K=... ATR=...
+ LowerBand=... SMA20=... UpperBand=... oscilador=STOCHASTIC K=... shift=1 umbral_compra=10... umbral_venta=90... ATR=...
  cierre_dentro_bandas=<true|false>
  mercado_disponible=true mercado_tick=<fecha_hora_cotizacion>
  mercado_bid=... mercado_ask=... mercado_referencia_e1=...
@@ -228,7 +556,7 @@ El Probador puede liquidar posiciones al terminar el periodo sin dar al EA otra 
 
 - Ejecutadas las pruebas de `test/`, incluida la nueva regresión de excursiones: MFE=0 en ideas siempre perdedoras; rebote positivo conservado con cierre negativo; E2 sin reinicio; medición conjunta frente a máximos individuales; cierres parciales y 24 permutaciones de cierres simultáneos; realizado final que establece un nuevo MAE; comisiones, fee/swap sin duplicación; datos incompletos y cambios de posiciones durante la lectura; presupuesto/R, fechas, duración y resumen atrasado después de iniciar otra idea. También se comprobó netting con entradas consolidadas y cambios de volumen compensados con historial atrasado.
 - Revisión estática por comparación con la versión anterior: señales, riesgo, niveles, TP, enfriamiento, reintentos, protección de propiedad e inicialización conservados. El flujo de `OnTick`, `OpenIdea`, `CloseStep` y `OnTradeTransaction` es idéntico al retirar las llamadas de diagnóstico. Un contrato estático de la suite prohíbe solicitudes de trading, cambios de estado operativo y logs por tick desde las funciones nuevas de medición.
-- La suite completa pasa **14 tests** (6 de comportamiento con múltiples escenarios, 4 del arnés y 4 contratos estáticos). Los tests de comportamiento compilan fragmentos actuales con C++ y adaptadores MT5: no son compilación MQL5 ni backtesting real. El intento de invocar MetaEditor volvió a fallar con `WSL ... UtilBindVsockAnyPort ... socket failed 1`. Quedan pendientes compilar esta versión en MetaEditor y comparar su operativa con la anterior en el Probador.
+- La suite completa pasa **22 tests** (14 de comportamiento con múltiples escenarios, 4 del arnés y 4 contratos estáticos). Los tests de comportamiento compilan fragmentos actuales con C++ y adaptadores MT5: no son compilación MQL5 ni backtesting real. El intento de invocar MetaEditor volvió a fallar con `WSL ... UtilBindVsockAnyPort ... socket failed 1`. Quedan pendientes compilar esta versión en MetaEditor y comparar su operativa con la anterior en el Probador.
 
 ## Ejemplo de riesgo
 
@@ -247,7 +575,7 @@ Comisiones y deslizamiento no se presupuestan al calcular el lote inicial. Sprea
 1. Compilar primero y abrir el Probador de Estrategias con Ctrl+R.
 2. Seleccionar `MeanReversionEA`, el símbolo XAUUSD del bróker y periodo **M5**.
 3. Elegir **Cada tick basado en ticks reales**, un intervalo con histórico suficiente y moneda de depósito **USD**. Configurar depósito, apalancamiento y especificaciones reales del símbolo; `InpRiskBaseUSD` continúa siendo la referencia de riesgo, independientemente del depósito.
-4. Mantener los parámetros predeterminados (`InpSignalMode=INTRABAR`) para la primera ejecución; repetir con `CLOSED_BAR` para comparar la variante al cierre. Desactivar optimización; usar modo visual para inspeccionar entradas, niveles y enfriamiento.
+4. Mantener los parámetros predeterminados (`InpOscillator=STOCHASTIC`, `InpSignalMode=INTRABAR`) para la primera ejecución; repetir con `CLOSED_BAR` para comparar la variante al cierre. Desactivar optimización; usar modo visual para inspeccionar entradas, niveles y enfriamiento.
 5. Ejecutar y conservar informe, operaciones y Diario. Comprobar `SIGNAL`, `ENTRY`, `TP_UPDATE`, `EXIT_REQUEST`, `EXIT`, `REJECTED`, `REQUEST_PENDING`, `EXIT_PENDING`, `ERROR` y `MANUAL_REQUIRED`.
 6. Contrastar los eventos con los 25 escenarios de la sección 12 de `SPEC_MVP.md`. Repetir en entornos de prueba hedging y netting; un backtest individual no demuestra ambas modalidades.
 7. Registrar fechas, modelo de ticks, fuente de datos, moneda, configuración del símbolo, modo de cuenta y valores de entrada para reproducibilidad.
@@ -270,7 +598,7 @@ No hay dependencias Python que instalar ni se necesita un entorno virtual. Para 
 uv run --no-project --no-managed-python --offline python3 -m unittest discover -s test -t . -v
 ```
 
-La suite usa `unittest`: 6 tests de comportamiento con múltiples escenarios internos, 4 comprobaciones del extractor/adaptador y 4 contratos estáticos. Cubre riesgo/lotaje, señales y modos, TP, enfriamiento, reintentos, identidad/PnL de cierres, MFE/MAE conjuntos y trazabilidad tras pausas. Extrae funciones del fuente actual y usa respuestas MT5 simuladas; no depende de snapshots o scripts temporales anteriores. Sin compilador C++17, los tests de comportamiento se marcan como omitidos, no como verificados.
+La suite usa `unittest`: 14 tests de comportamiento con múltiples escenarios internos, 4 comprobaciones del extractor/adaptador y 4 contratos estáticos. Cubre riesgo/lotaje, señales y modos, TP, enfriamiento, reintentos, identidad/PnL de cierres, MFE/MAE conjuntos y trazabilidad tras pausas. Extrae funciones del fuente actual y usa respuestas MT5 simuladas; no depende de snapshots o scripts temporales anteriores. Sin compilador C++17, los tests de comportamiento se marcan como omitidos, no como verificados.
 
 Los detalles y límites están en [`test/README.md`](test/README.md). Estas pruebas no sustituyen compilación MQL5 ni backtesting MT5. `.gitignore` excluye los artefactos locales; los fixtures fuente de la suite sí se conservan.
 

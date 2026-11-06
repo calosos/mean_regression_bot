@@ -119,3 +119,5 @@ long OrderGetInteger(int field) {
  assert(false); return 0;
 }
 double OrderGetDouble(int field) { return field==ORDER_VOLUME_INITIAL ? live_orders.at(selected_order).initial : live_orders.at(selected_order).current; }
+
+#include "partial_legacy_mock.hpp"

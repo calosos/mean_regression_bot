@@ -3,6 +3,32 @@
 #property description "Mean reversion MVP, Strategy Tester only, USD / M5"
 #include <Trade/Trade.mqh>
 
+enum Strategy { ORIGINAL=0, BB_REENTRY=1, BB_WICK_REJECTION=2, ATR_DEVIATION_REENTRY=3 };
+input Strategy InpStrategy=ORIGINAL;
+input double InpWickMinRatio=0.40;
+input double InpATRDeviationThreshold=1.5;
+input double InpReentrySLATR=3.0;
+enum ReentryExitMode { EXIT_SMA20_DYNAMIC=0, EXIT_ATR_FIXED_2=1, EXIT_HALF_SMA20_DYNAMIC=2, EXIT_OPPOSITE_BAND_DYNAMIC=3, EXIT_HALF_SMA20_TRAIL_ATR=4 };
+input ReentryExitMode InpReentryExitMode=EXIT_SMA20_DYNAMIC;
+input bool   InpReentryBBWFilter=false;
+enum ReentryBBWMode { BBW_NON_INCREASING, BBW_BELOW_P70 };
+input ReentryBBWMode InpReentryBBWMode=BBW_NON_INCREASING;
+enum ReentryADXMode { ADX_OFF, ADX_BELOW_25, ADX_BELOW_20, ADX_BELOW_25_FALLING };
+input ReentryADXMode InpReentryADXMode=ADX_OFF;
+input bool   InpReentryMACDConfirm=false;
+input int    InpMACDFast=12;
+input int    InpMACDSlow=26;
+input int    InpMACDSignal=9;
+input bool   InpReentryWeekendGuard=false;
+input int    InpWeekendEntryBlockMinutes=60;
+input int    InpWeekendCloseMinutes=30;
+
+enum Oscillator { STOCHASTIC, RSI };
+input Oscillator InpOscillator=STOCHASTIC;
+input int    InpRSIPeriod=14;
+input double InpRSIBuyLevel=30;
+input double InpRSISellLevel=70;
+
 enum SignalMode { INTRABAR, CLOSED_BAR };
 input SignalMode InpSignalMode=INTRABAR;
 input ulong  InpMagicNumber=20261104;
@@ -21,8 +47,19 @@ input bool   InpDetailedLogs=true;
 
 enum EAState { WAITING_SIGNAL, ACTIVE_IDEA, CLOSING_IDEA, COOLDOWN };
 EAState state=WAITING_SIGNAL;
+enum ReentryState { NONE, WAIT_BUY_REENTRY, WAIT_SELL_REENTRY };
+ReentryState reentry_state=NONE;
+datetime reentry_outer_bar=0;
+double deviation_prep_close=0,deviation_prep_sma=0,deviation_prep_atr=0,deviation_prep_d=0;
+struct WeeklySession { long begin; long end; };
+bool g_weekend_valid=false,g_weekend_blocked=false,g_weekend_known=false,g_weekend_close_due=false;
+datetime g_weekend_close=0,g_weekend_reopen=0,g_weekend_refresh=0,g_weekend_observed=0,g_weekend_missed=0;
+string g_weekend_problem="";
 CTrade trade;
-int bands=INVALID_HANDLE,stoch=INVALID_HANDLE,atr_handle=INVALID_HANDLE;
+int sma_handle=INVALID_HANDLE;
+int adx_handle=INVALID_HANDLE;
+int macd_handle=INVALID_HANDLE;
+int bands=INVALID_HANDLE,oscillator_handle=INVALID_HANDLE,atr_handle=INVALID_HANDLE;
 bool netting=false,manual_required=false,history_ok=false,had_exposure=false;
 double tick_size=0,volume_step=0,volume_min=0,volume_max=0;
 double frozen_atr=0,entry_price=0,lot=0,g_sl=0,target=0;
@@ -35,6 +72,16 @@ ulong position_ids[];
 string signal_key="";
 string exit_reason="";
 double realized=0;
+struct HalfExitState
+{
+   bool triggered,pending,trailing;
+   double initial_volume,close_volume,extreme,requested_sl;
+   ulong position_id,ticket,order;
+   uint request_id,sequence;
+   string comment;
+};
+HalfExitState g_half;
+ulong g_half_orders[];
 struct ExcursionStats
 {
    long e1_msc;
@@ -270,6 +317,11 @@ void ReconcilePending()
 }
 bool Locked(const ulong ticket,const bool deletion)
 {
+   if(HalfExitMode() && g_half.pending && !deletion)
+   {
+      if(ticket==g_half.ticket) return true;
+      if(PositionSelectByTicket(ticket) && (ulong)PositionGetInteger(POSITION_IDENTIFIER)==g_half.position_id) return true;
+   }
    for(int i=0;i<ArraySize(pending);i++)
       if(!pending[i].entry && pending[i].ticket==ticket && pending[i].deletion==deletion) return true;
    return false;
@@ -286,6 +338,451 @@ void LockResult(const ulong ticket,const bool deletion,const bool entry)
    pending[n].deletion=deletion; pending[n].entry=entry;
    Log("REQUEST_PENDING",StringFormat("request=%u ticket=%I64u code=%u",r.request_id,ticket,r.retcode),true);
 }
+void ClearReentry(const string reason)
+{
+   if(InpStrategy==ATR_DEVIATION_REENTRY && reentry_state!=NONE)
+   {
+      Log("PREPARATION_CLEAR",StringFormat("estrategia=ATR_DEVIATION_REENTRY direccion=%s vela=%s motivo=%s",
+          reentry_state==WAIT_BUY_REENTRY ? "BUY" : "SELL",TimeToString(reentry_outer_bar,TIME_DATE|TIME_SECONDS),reason));
+      reentry_state=NONE; reentry_outer_bar=0;
+      deviation_prep_close=0; deviation_prep_sma=0; deviation_prep_atr=0; deviation_prep_d=0;
+      return;
+   }
+   if(InpStrategy!=BB_REENTRY || reentry_state==NONE) return;
+   Log("PREPARATION_CLEAR",StringFormat("estrategia=BB_REENTRY direccion=%s vela_exterior=%s motivo=%s",
+       reentry_state==WAIT_BUY_REENTRY ? "BUY" : "SELL",
+       TimeToString(reentry_outer_bar,TIME_DATE|TIME_SECONDS),reason));
+   reentry_state=NONE;
+   reentry_outer_bar=0;
+}
+void ResetWeekendGuard()
+{
+   g_weekend_valid=false; g_weekend_blocked=false; g_weekend_known=false; g_weekend_close_due=false;
+   g_weekend_close=0; g_weekend_reopen=0; g_weekend_refresh=0; g_weekend_observed=0; g_weekend_missed=0;
+   g_weekend_problem="";
+}
+bool WeekendGuardEnabled()
+{
+   return InpStrategy!=ORIGINAL && InpReentryWeekendGuard;
+}
+// Session dates are irrelevant; use time-of-day and the broker's weekday.
+// Merge a repeated weekly pattern so overnight sessions and the Sunday seam
+// are treated exactly like sessions within a day.
+bool ReadWeeklyBreak(long &close_offset,long &open_offset,string &problem)
+{
+   WeeklySession spans[];
+   ArrayResize(spans,0);
+   for(int day=0;day<7;day++)
+   {
+      bool ended=false;
+      for(uint index=0;index<128;index++)
+      {
+         datetime from=0,to=0;
+         ResetLastError();
+         if(!SymbolInfoSessionTrade(_Symbol,(ENUM_DAY_OF_WEEK)day,index,from,to))
+         {
+            int error=GetLastError();
+            if(error!=0 && error!=ERR_MARKET_SESSION_INDEX)
+            { problem=StringFormat("sesiones no disponibles dia=%d indice=%u error=%d",day,index,error); return false; }
+            ended=true;
+            break;
+         }
+         MqlDateTime start_time={},end_time={};
+         if(!TimeToStruct(from,start_time) || !TimeToStruct(to,end_time))
+         { problem="hora de sesion no interpretable"; return false; }
+         long start=start_time.hour*3600+start_time.min*60+start_time.sec;
+         long finish=end_time.hour*3600+end_time.min*60+end_time.sec;
+         if(start==finish && start!=0)
+         { problem="sesion con extremos iguales fuera de medianoche; duracion ambigua"; return false; }
+         if(finish<=start) finish+=86400; // 00:00 end, overnight, or full 00:00-00:00 day.
+         for(int repeat=-1;repeat<=1;repeat++)
+         {
+            int n=ArraySize(spans);
+            ArrayResize(spans,n+1);
+            spans[n].begin=day*86400+start+repeat*604800;
+            spans[n].end=day*86400+finish+repeat*604800;
+         }
+      }
+      if(!ended) { problem="demasiadas sesiones; horario incompleto"; return false; }
+   }
+   int count=ArraySize(spans);
+   if(count==0) { problem="simbolo sin sesiones de trading disponibles"; return false; }
+   for(int i=1;i<count;i++)
+   {
+      WeeklySession item=spans[i];
+      int j=i-1;
+      while(j>=0 && spans[j].begin>item.begin)
+      { spans[j+1]=spans[j]; j--; }
+      spans[j+1]=item;
+   }
+   long end=spans[0].end;
+   int breaks=0;
+   for(int i=1;i<count;i++)
+   {
+      if(spans[i].begin>end)
+      {
+         if(end>=0 && end<604800 && spans[i].begin-end>86400)
+         { close_offset=end; open_offset=spans[i].begin; breaks++; }
+         end=spans[i].end;
+      }
+      else if(spans[i].end>end) end=spans[i].end;
+   }
+   if(breaks!=1)
+   { problem=StringFormat("descanso semanal no identificable: interrupciones superiores a 24h=%d",breaks); return false; }
+   return true;
+}
+void RefreshWeekendGuard()
+{
+   if(!WeekendGuardEnabled()) return;
+   datetime now=TimeCurrent();
+   // Query changes at most once per server minute; boundary checks run every event.
+   if(g_weekend_refresh==0 || now>=g_weekend_refresh || now<g_weekend_observed)
+   {
+      g_weekend_refresh=now+60;
+      long close_offset=0,open_offset=0;
+      string problem="";
+      bool valid=ReadWeeklyBreak(close_offset,open_offset,problem);
+      MqlDateTime clock={};
+      if(valid && !TimeToStruct(now,clock)) { valid=false; problem="hora del servidor no interpretable"; }
+      if(valid)
+      {
+         datetime sunday=now-clock.hour*3600-clock.min*60-clock.sec-clock.day_of_week*86400;
+         datetime close_at=0,reopen_at=0;
+         for(int week=-1;week<=1;week++)
+         {
+            datetime candidate_open=(datetime)((long)sunday+open_offset+(long)week*604800);
+            if(candidate_open>now)
+            {
+               close_at=(datetime)((long)sunday+close_offset+(long)week*604800);
+               reopen_at=candidate_open;
+               break;
+            }
+         }
+         if(reopen_at==0) { valid=false; problem="no se pudo proyectar la siguiente sesion semanal"; }
+         else
+         {
+            // Before moving to a new week, report any missed prior deadline.
+            if(g_weekend_valid && g_weekend_close!=0 && now>=g_weekend_close &&
+               g_weekend_missed!=g_weekend_close && OwnPositions()>0)
+            {
+               Log("WEEKEND_EXPOSURE",StringFormat("cierre_semanal=%s queda exposicion; cierre no garantizado; mantener gestion y reintentos",
+                   TimeToString(g_weekend_close,TIME_DATE|TIME_SECONDS)),true);
+               g_weekend_missed=g_weekend_close;
+               if(state==ACTIVE_IDEA) BeginClose("WEEKEND_GUARD");
+            }
+            if(!g_weekend_valid || close_at!=g_weekend_close || reopen_at!=g_weekend_reopen)
+               Log("WEEKEND_SCHEDULE",StringFormat("cierre=%s reapertura=%s hora=servidor",
+                   TimeToString(close_at,TIME_DATE|TIME_SECONDS),TimeToString(reopen_at,TIME_DATE|TIME_SECONDS)),true);
+            g_weekend_close=close_at;
+            g_weekend_reopen=reopen_at;
+         }
+      }
+      if(!valid && (g_weekend_valid || problem!=g_weekend_problem))
+         Log("WEEKEND_SCHEDULE_ERROR",problem+"; entradas bloqueadas; gestion existente conservada; sin hora supuesta",true);
+      g_weekend_valid=valid;
+      g_weekend_problem=problem;
+   }
+   g_weekend_observed=now;
+   bool blocked=!g_weekend_valid ||
+       (now>=(datetime)((long)g_weekend_close-(long)InpWeekendEntryBlockMinutes*60) && now<g_weekend_reopen);
+   g_weekend_close_due=g_weekend_valid &&
+       now>=(datetime)((long)g_weekend_close-(long)InpWeekendCloseMinutes*60) && now<g_weekend_reopen;
+   if(g_weekend_valid && now>=g_weekend_close && now<g_weekend_reopen &&
+      g_weekend_missed!=g_weekend_close && OwnPositions()>0)
+   {
+      Log("WEEKEND_EXPOSURE",StringFormat("cierre_semanal=%s queda exposicion; mantener cierre y reintentos",
+          TimeToString(g_weekend_close,TIME_DATE|TIME_SECONDS)),true);
+      g_weekend_missed=g_weekend_close;
+   }
+   if(!g_weekend_known || blocked!=g_weekend_blocked)
+   {
+      if(blocked || g_weekend_known)
+         Log(blocked ? "WEEKEND_BLOCK_START" : "WEEKEND_BLOCK_END",
+             g_weekend_valid ? "hora del servidor; preparacion reiniciada" : "horario no valido; preparacion reiniciada",true);
+      ClearReentry(blocked ? "bloqueo semanal" : "fin de bloqueo semanal");
+      // Never evaluate the bar that preceded the first event after reopening.
+      if(g_weekend_known && !blocked) g_last_signal_bar=BarOf(now);
+   }
+   g_weekend_known=true;
+   g_weekend_blocked=blocked;
+   if(blocked) ClearReentry("bloqueo semanal");
+   if(g_weekend_close_due && state==ACTIVE_IDEA) BeginClose("WEEKEND_GUARD");
+}
+// Closing gets the first management request of the tick. Remaining exposure
+// retains logical SL/TP/risk supervision without changing the exit reason.
+void SuperviseWeekendClose()
+{
+   if(!WeekendGuardEnabled() || state!=CLOSING_IDEA || exit_reason!="WEEKEND_GUARD" || manual_required || !history_ok) return;
+   if(OwnPositions()==0) return;
+   MqlTick q;
+   if(!SymbolInfoTick(_Symbol,q)) return;
+   double pnl=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(PositionOwner(ticket)!=1 || !PositionSelectByTicket(ticket)) continue;
+      pnl+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+   }
+   if(pnl<=-Budget()) BeginClose("Limite monetario flotante");
+   if(direction>0 ? q.bid<=g_sl : q.ask>=g_sl) BeginClose("SL comun");
+   datetime bar=iTime(_Symbol,PERIOD_M5,0);
+   if(!(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2) && !(HalfExitMode() && g_half.trailing) && bar!=0 && tp_bar!=bar)
+   {
+      double mid,upper,lower;
+      if(TargetInputs(1,mid,upper,lower))
+      {
+         double previous=target;
+         target=Target(mid,upper,lower); tp_bar=bar;
+         if(!SamePrice(previous,target)) Log("TP_UPDATE",StringFormat("anterior=%.5f nuevo=%.5f",previous,target));
+      }
+      else Problem("Indicadores TP no disponibles durante WEEKEND_GUARD; reintentar");
+   }
+   if(HalfExitMode()) return; // Whole-idea closing takes priority; never start another partial here.
+   if(HitTarget(q)) BeginClose(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2 ? "TP fijo" : "TP dinamico");
+   SyncTP();
+}
+
+bool HalfExitMode()
+{
+   return InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_HALF_SMA20_TRAIL_ATR;
+}
+void ResetHalfExit()
+{
+   g_half.triggered=false; g_half.pending=false; g_half.trailing=false;
+   g_half.initial_volume=0; g_half.close_volume=0; g_half.extreme=0; g_half.requested_sl=0;
+   g_half.position_id=0; g_half.ticket=0; g_half.order=0; g_half.request_id=0; g_half.sequence=0; g_half.comment="";
+   ArrayResize(g_half_orders,0);
+}
+bool HalfKnownOrder(const ulong order)
+{
+   if(order==0) return false;
+   for(int i=0;i<ArraySize(g_half_orders);i++) if(g_half_orders[i]==order) return true;
+   return false;
+}
+void HalfRememberOrder(const ulong order)
+{
+   if(order==0 || HalfKnownOrder(order)) return;
+   int n=ArraySize(g_half_orders); ArrayResize(g_half_orders,n+1); g_half_orders[n]=order;
+}
+// SL/TP deals always retain their normal whole-idea exit semantics. Defer an
+// unclassified own expert exit only while its partial request is unresolved.
+bool IgnoreHalfDeal(const ulong deal)
+{
+   if(!HalfExitMode() || g_half.position_id==0) return false;
+   if((ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID)!=g_half.position_id ||
+      (ENUM_DEAL_REASON)HistoryDealGetInteger(deal,DEAL_REASON)!=DEAL_REASON_EXPERT) return false;
+   return HalfKnownOrder((ulong)HistoryDealGetInteger(deal,DEAL_ORDER)) || (g_half.pending && g_half.order==0);
+}
+ulong HalfPosition()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(PositionOwner(ticket)!=1 || !PositionSelectByTicket(ticket)) continue;
+      if((ulong)PositionGetInteger(POSITION_IDENTIFIER)==g_half.position_id) return ticket;
+   }
+   return 0;
+}
+bool HalfVolumeValid(const double volume)
+{
+   return MathIsValidNumber(volume) && volume>=volume_min && volume<=volume_max &&
+          MathAbs(volume/volume_step-MathRound(volume/volume_step))<0.000001;
+}
+bool HalfSplit(const double initial,double &part)
+{
+   if(!HalfVolumeValid(initial)) return false;
+   long steps=(long)MathRound(initial/volume_step);
+   part=NormalizeDouble((steps/2)*volume_step,8);
+   return HalfVolumeValid(part) && HalfVolumeValid(NormalizeDouble(initial-part,8));
+}
+void HalfExitTransaction(const MqlTradeRequest &request,const MqlTradeResult &result)
+{
+   if(!HalfExitMode() || !g_half.pending || request.magic!=InpMagicNumber || request.symbol!=_Symbol ||
+      request.comment!=g_half.comment || request.position!=g_half.ticket) return;
+   if(result.order!=0) { g_half.order=result.order; HalfRememberOrder(result.order); }
+   // A timeout/connection result cannot prove that an order did not execute.
+   if(g_half.order==0 && result.retcode!=0 && !Uncertain(result.retcode) && result.retcode!=TRADE_RETCODE_DONE && result.retcode!=TRADE_RETCODE_DONE_PARTIAL)
+   {
+      g_half.pending=false;
+      RememberManagementResult(g_half.ticket,false,result.retcode);
+      Log("PARTIAL_REJECTED",StringFormat("request=%u code=%u; reintentar con volumen reconciliado",result.request_id,result.retcode),true);
+   }
+}
+// No unlock based on elapsed time: recover the exact order by its unique
+// comment/magic/symbol and wait for terminal history AND all of its deals.
+bool ReconcileHalfExit(double &closed)
+{
+   closed=0;
+   if(!HalfExitMode() || g_half.position_id==0) return true;
+   if(!HistorySelect(idea_start,TimeCurrent())) { Problem("Parcial: historial no disponible; no reenviar"); return false; }
+   if(g_half.pending && g_half.order==0)
+   {
+      for(int i=0;i<HistoryOrdersTotal();i++)
+      {
+         ulong order=HistoryOrderGetTicket(i);
+         if(HistoryOrderGetString(order,ORDER_SYMBOL)==_Symbol &&
+            (ulong)HistoryOrderGetInteger(order,ORDER_MAGIC)==InpMagicNumber &&
+            HistoryOrderGetString(order,ORDER_COMMENT)==g_half.comment)
+         { g_half.order=order; HalfRememberOrder(order); break; }
+      }
+   }
+   bool terminal=true;
+   for(int j=0;j<ArraySize(g_half_orders);j++)
+   {
+      ulong order=g_half_orders[j];
+      if(!HistoryOrderSelect(order)) return false;
+      ENUM_ORDER_STATE os=(ENUM_ORDER_STATE)HistoryOrderGetInteger(order,ORDER_STATE);
+      if(os!=ORDER_STATE_FILLED && os!=ORDER_STATE_CANCELED && os!=ORDER_STATE_REJECTED && os!=ORDER_STATE_EXPIRED)
+      { terminal=false; continue; }
+      double expected=0;
+      if(os!=ORDER_STATE_REJECTED)
+      {
+         expected=HistoryOrderGetDouble(order,ORDER_VOLUME_INITIAL);
+         if(os!=ORDER_STATE_FILLED) expected-=HistoryOrderGetDouble(order,ORDER_VOLUME_CURRENT);
+      }
+      if(!HistorySelect(idea_start,TimeCurrent())) return false;
+      double volume=0;
+      for(int i=0;i<HistoryDealsTotal();i++)
+      {
+         ulong deal=HistoryDealGetTicket(i);
+         if((ulong)HistoryDealGetInteger(deal,DEAL_ORDER)!=order) continue;
+         if((ulong)HistoryDealGetInteger(deal,DEAL_MAGIC)!=InpMagicNumber ||
+            HistoryDealGetString(deal,DEAL_SYMBOL)!=_Symbol ||
+            (ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID)!=g_half.position_id ||
+            (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal,DEAL_ENTRY)!=DEAL_ENTRY_OUT)
+         { BeginClose("Parcial con identidad o tipo inesperado"); return false; }
+         volume+=HistoryDealGetDouble(deal,DEAL_VOLUME);
+      }
+      if(MathAbs(expected-volume)>volume_step*0.1) return false;
+      closed+=volume;
+   }
+   if(g_half.pending && (g_half.order==0 || !terminal)) return false;
+   ulong ticket=HalfPosition();
+   if(manual_required || !history_ok) return false;
+   if(ticket!=0 && !PositionSelectByTicket(ticket)) return false;
+   double remaining=ticket==0 ? 0 : PositionGetDouble(POSITION_VOLUME);
+   if(closed>g_half.close_volume+volume_step*0.1)
+   { BeginClose("Parcial excedio el volumen previsto"); return false; }
+   if(!HistorySelect(idea_start,TimeCurrent())) return false;
+   double all_exits=0;
+   for(int i=0;i<HistoryDealsTotal();i++)
+   {
+      ulong deal=HistoryDealGetTicket(i);
+      if((ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID)!=g_half.position_id) continue;
+      ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal,DEAL_ENTRY);
+      if(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY) all_exits+=HistoryDealGetDouble(deal,DEAL_VOLUME);
+   }
+   // Include any concurrent SL/full close in the volume equation; otherwise
+   // a completed partial could remain locked forever after that other exit.
+   if(ticket!=0 && MathAbs(g_half.initial_volume-all_exits-remaining)>volume_step*0.1) return false;
+   g_half.pending=false;
+   // Full closure by SL/weekend/etc. is completed by the common close path.
+   if(ticket==0 || state!=ACTIVE_IDEA || !g_half.triggered || g_half.trailing) return true;
+   if(MathAbs(closed-g_half.close_volume)<=volume_step*0.1)
+   {
+      MqlTick q; if(!SymbolInfoTick(_Symbol,q)) { Problem("Parcial reconciliado sin cotizacion; esperar para iniciar trailing"); return false; }
+      g_half.extreme=direction>0 ? q.bid : q.ask;
+      g_half.trailing=true;
+      Log("PARTIAL_CONFIRMED",StringFormat("cerrado=%.8f restante=%.8f trailing_inicio=%.10f ATR_congelado=%.10f",closed,remaining,g_half.extreme,frozen_atr),true);
+   }
+   return true;
+}
+void ObserveHalfExtreme()
+{
+   if(!HalfExitMode() || state!=ACTIVE_IDEA || !g_half.trailing) return;
+   MqlTick q; if(!SymbolInfoTick(_Symbol,q)) return;
+   if(direction>0) g_half.extreme=MathMax(g_half.extreme,q.bid);
+   else g_half.extreme=MathMin(g_half.extreme,q.ask);
+}
+void HalfExitStep()
+{
+   if(!HalfExitMode() || state!=ACTIVE_IDEA || g_half.position_id==0) return;
+   ObserveHalfExtreme();
+   CheckOwnership(); if(manual_required || !history_ok) return;
+   double closed=0;
+   if(!ReconcileHalfExit(closed)) return;
+   ulong ticket=HalfPosition();
+   if(ticket==0 || manual_required || !history_ok || !PositionSelectByTicket(ticket)) return;
+   if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=(direction>0 ? POSITION_TYPE_BUY : POSITION_TYPE_SELL))
+   { BeginClose("Direccion inesperada durante salida parcial"); return; }
+   double current_sl=PositionGetDouble(POSITION_SL);
+   if(g_half.requested_sl>0 && SamePrice(current_sl,g_half.requested_sl))
+   {
+      if(direction>0 ? current_sl>g_sl : current_sl<g_sl)
+      {
+         Log("TRAIL_UPDATE",StringFormat("anterior=%.10f nuevo=%.10f extremo=%.10f ATR_congelado=%.10f",g_sl,current_sl,g_half.extreme,frozen_atr),true);
+         g_sl=current_sl;
+      }
+      g_half.requested_sl=0;
+   }
+   if(!SamePrice(current_sl,g_sl)) { BeginClose("SL ausente o alterado durante salida parcial"); return; }
+   MqlTick q; if(!SymbolInfoTick(_Symbol,q)) return;
+   if(direction>0 ? q.bid<=g_sl : q.ask>=g_sl)
+   { BeginClose("SL vigente alcanzado durante salida parcial"); return; }
+   double candidate=g_sl;
+   if(g_half.trailing)
+   {
+      if(direction>0) g_half.extreme=MathMax(g_half.extreme,q.bid);
+      else g_half.extreme=MathMin(g_half.extreme,q.ask);
+      double proposed=Price(g_half.extreme-direction*frozen_atr);
+      bool tighter=direction>0 ? proposed>g_sl : proposed<g_sl;
+      double distance=StopDistance();
+      bool valid=direction>0 ? proposed<q.bid && q.bid-proposed>=distance : proposed>q.ask && proposed-q.ask>=distance;
+      if(tighter && valid) candidate=proposed;
+   }
+   // Always remove any broker TP; SMA is a logical partial trigger only.
+   bool remove_tp=!SamePrice(PositionGetDouble(POSITION_TP),0);
+   if(remove_tp || !SamePrice(candidate,g_sl))
+   {
+      if(Locked(ticket,false) || !ManagementRequestAllowed(ticket,false)) return;
+      g_half.requested_sl=candidate;
+      trade.PositionModify(ticket,candidate,0);
+      uint code=trade.ResultRetcode(); RememberManagementResult(ticket,false,code);
+      if(Uncertain(code)) LockResult(ticket,false,false);
+      if(code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_NO_CHANGES) Problem("Trailing/TP pendiente; conservar SL vigente: "+trade.ResultRetcodeDescription());
+      if(PositionSelectByTicket(ticket) && SamePrice(PositionGetDouble(POSITION_SL),candidate))
+      {
+         if(!SamePrice(candidate,g_sl)) Log("TRAIL_UPDATE",StringFormat("anterior=%.10f nuevo=%.10f extremo=%.10f ATR_congelado=%.10f",g_sl,candidate,g_half.extreme,frozen_atr),true);
+         g_sl=candidate; g_half.requested_sl=0;
+      }
+      return;
+   }
+   if(g_half.trailing || g_half.pending) return;
+   if(!g_half.triggered)
+   {
+      if(!HitTarget(q)) return;
+      g_half.triggered=true;
+      Log("PARTIAL_TARGET",StringFormat("objetivo=%.10f Bid=%.10f Ask=%.10f volumen_inicial=%.8f",target,q.bid,q.ask,g_half.initial_volume),true);
+      if(!HalfSplit(g_half.initial_volume,g_half.close_volume))
+      { Log("PARTIAL_NOT_POSSIBLE","division de volumen invalida; cerrar toda la idea",true); BeginClose("PARTIAL_NOT_POSSIBLE"); return; }
+   }
+   double amount=NormalizeDouble(g_half.close_volume-closed,8);
+   if(!HalfVolumeValid(amount))
+   { Log("PARTIAL_NOT_POSSIBLE","remanente de ejecucion parcial no negociable; cerrar toda la idea",true); BeginClose("PARTIAL_NOT_POSSIBLE"); return; }
+   if(Locked(ticket,false) || !ManagementRequestAllowed(ticket,false)) return;
+   // Recheck identity and exact volume immediately before sending a targeted
+   // opposite deal. position is supplied for BOTH hedging and netting accounts.
+   if(PositionOwner(ticket)!=1 || !PositionSelectByTicket(ticket) || manual_required || !history_ok) return;
+   if(MathAbs(PositionGetDouble(POSITION_VOLUME)-(g_half.initial_volume-closed))>volume_step*0.1) return;
+   MqlTradeRequest request={}; MqlTradeResult result={};
+   request.action=TRADE_ACTION_DEAL; request.position=ticket; request.symbol=_Symbol; request.magic=InpMagicNumber;
+   request.type=direction>0 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   request.volume=amount; request.price=direction>0 ? q.bid : q.ask; request.deviation=InpDeviationPoints;
+   long filling=SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   request.type_filling=(filling & SYMBOL_FILLING_FOK)!=0 ? ORDER_FILLING_FOK : ((filling & SYMBOL_FILLING_IOC)!=0 ? ORDER_FILLING_IOC : ORDER_FILLING_RETURN);
+   g_half.sequence++;
+   g_half.comment=StringFormat("MRH.%I64d.%u",(long)idea_start,g_half.sequence); request.comment=g_half.comment;
+   g_half.ticket=ticket; g_half.order=0; g_half.request_id=0; g_half.pending=true;
+   Log("PARTIAL_REQUEST",StringFormat("ticket=%I64u volumen=%.8f restante_previsto=%.8f comentario=%s",ticket,amount,g_half.initial_volume-g_half.close_volume,g_half.comment),true);
+   bool sent=OrderSend(request,result);
+   g_half.request_id=result.request_id; g_half.order=result.order; HalfRememberOrder(result.order);
+   RememberManagementResult(ticket,false,result.retcode);
+   if(!sent && result.retcode==0)
+   { Problem("Resultado de envio parcial desconocido; esperar historial, no duplicar"); }
+   else HalfExitTransaction(request,result);
+   if(g_half.pending) Log("PARTIAL_PENDING",StringFormat("request=%u orden=%I64u code=%u; esperar historial y volumen; no duplicar",result.request_id,result.order,result.retcode),true);
+}
+
 void BeginClose(const string why)
 {
    if(state!=CLOSING_IDEA) { exit_reason=why; Log("EXIT_REQUEST",why,true); }
@@ -298,8 +795,10 @@ void Abort(const string why)
 }
 void Cooldown(const datetime closed)
 {
+   ClearReentry("inicio de enfriamiento");
    cooldown_until=BarOf(closed)+600;
    state=COOLDOWN;
+   if(HalfExitMode()) ResetHalfExit();
 }
 void CloseStep()
 {
@@ -330,7 +829,7 @@ void CloseStep()
          Problem("Cierre fallido: "+trade.ResultRetcodeDescription());
    }
    CheckOwnership();
-   if(!manual_required && history_ok && OwnPositions()==0 && OwnOrders()==0 && ArraySize(pending)==0)
+   if(!manual_required && history_ok && OwnPositions()==0 && OwnOrders()==0 && ArraySize(pending)==0 && !(HalfExitMode() && g_half.pending))
    {
       InspectIdeaHistory();
       if(manual_required || !history_ok) return;
@@ -351,12 +850,31 @@ bool Bands(const int shift,double &mid,double &upper,double &lower)
 {
    return Value(bands,0,shift,mid) && Value(bands,1,shift,upper) && Value(bands,2,shift,lower);
 }
+bool TargetInputs(const int shift,double &mid,double &upper,double &lower)
+{
+   if(InpStrategy!=ATR_DEVIATION_REENTRY) return Bands(shift,mid,upper,lower);
+   upper=0; lower=0;
+   return Value(sma_handle,0,shift,mid) && mid>0;
+}
 double Target(const double mid,const double upper,const double lower)
 {
+   if(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_OPPOSITE_BAND_DYNAMIC)
+      return Price(direction>0 ? upper : lower);
+   if(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_HALF_SMA20_DYNAMIC)
+      return Price(entry_price+0.50*(mid-entry_price));
+   if(InpStrategy!=ORIGINAL) return Price(mid);
    return Price(direction>0 ? lower+InpTPFactor*(mid-lower) : upper-InpTPFactor*(upper-mid));
 }
 bool Risk(const double volume,const double e1,const double e2,const double stop,double &risk)
 {
+   if(InpStrategy!=ORIGINAL)
+   {
+      if(volume<=0 || e1<=0 || stop<=0 || (direction>0 ? stop>=e1 : stop<=e1)) return false;
+      double pnl=0;
+      ENUM_ORDER_TYPE type=direction>0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      if(!OrderCalcProfit(type,_Symbol,volume,e1,stop,pnl)) return false;
+      risk=-pnl; return MathIsValidNumber(risk) && risk>0;
+   }
    if(volume<=0 || stop<=0 || e2<=0 || (direction>0 ? !(stop<e2 && e2<e1) : !(stop>e2 && e2>e1))) return false;
    double a=0,b=0;
    ENUM_ORDER_TYPE type=direction>0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
@@ -365,8 +883,8 @@ bool Risk(const double volume,const double e1,const double e2,const double stop,
 }
 void Levels(const double e1,double &e2,double &stop)
 {
-   e2=Price(e1-direction*frozen_atr);
-   stop=Price(e1-direction*3.0*frozen_atr);
+   e2=InpStrategy!=ORIGINAL ? 0 : Price(e1-direction*frozen_atr);
+   stop=Price(e1-direction*(InpStrategy!=ORIGINAL ? InpReentrySLATR : 3.0)*frozen_atr);
 }
 bool Size(const double e1,double &volume)
 {
@@ -404,6 +922,7 @@ bool ValidTP(const MqlTick &q)
 // Otherwise the old TP could close the idea before the new target is reached.
 void SyncTP()
 {
+   if(HalfExitMode()) { HalfExitStep(); return; }
    CheckOwnership(); if(manual_required || !history_ok) return;
    MqlTick q; if(!SymbolInfoTick(_Symbol,q)) return;
    if(HitTarget(q)) { BeginClose("TP"); return; }
@@ -419,7 +938,7 @@ void SyncTP()
       uint code=trade.ResultRetcode();
       RememberManagementResult(t,false,code);
       if(Uncertain(code)) LockResult(t,false,false);
-      if(code==TRADE_RETCODE_DONE) Log("TP_UPDATE",StringFormat("posicion=%I64u objetivo=%.5f TP_servidor=%.5f resultado=%u",t,target,broker_tp,code));
+      if(code==TRADE_RETCODE_DONE) Log(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2 ? "TP_SYNC" : "TP_UPDATE",StringFormat("posicion=%I64u objetivo=%.5f TP_servidor=%.5f resultado=%u",t,target,broker_tp,code));
       if(code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_NO_CHANGES) Problem("TP pendiente de sincronizar: "+trade.ResultRetcodeDescription());
    }
    if(manual_required || !history_ok) return;
@@ -444,7 +963,7 @@ bool SetInitialSL()
 {
    CheckOwnership(); if(manual_required || !history_ok) return false;
    MqlTick q; if(!SymbolInfoTick(_Symbol,q) || !ValidSL(q)) return false;
-   double tp=(!HitTarget(q) && ValidTP(q)) ? target : 0;
+   double tp=(!HalfExitMode() && !HitTarget(q) && ValidTP(q)) ? target : 0;
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong t=PositionGetTicket(i);
@@ -469,8 +988,8 @@ bool SetInitialSL()
 int SignalSide(const double low,const double high,const double lower,const double upper,const double k,
                const datetime bar)
 {
-   if(low<=lower && k<10 && processed_buy!=bar) return 1;
-   if(high>=upper && k>90 && processed_sell!=bar) return -1;
+   if(low<=lower && k<(InpOscillator==RSI ? InpRSIBuyLevel : 10) && processed_buy!=bar) return 1;
+   if(high>=upper && k>(InpOscillator==RSI ? InpRSISellLevel : 90) && processed_sell!=bar) return -1;
    return 0;
 }
 // Consume the new-bar opportunity before any active idea/cooldown early return.
@@ -486,6 +1005,12 @@ int ClosedSignalSide(const MqlRates &candle,const double lower,const double uppe
 {
    if(candle.close<=lower || candle.close>=upper) return 0;
    return SignalSide(candle.low,candle.high,lower,upper,k,candle.time);
+}
+string OscillatorSnapshot(const double value,const int shift)
+{
+   return StringFormat("oscilador=%s %s=%.10f shift=%d umbral_compra=%.10f umbral_venta=%.10f",
+          InpOscillator==RSI ? "RSI" : "STOCHASTIC",InpOscillator==RSI ? "RSI" : "K",value,shift,
+          InpOscillator==RSI ? InpRSIBuyLevel : 10.0,InpOscillator==RSI ? InpRSISellLevel : 90.0);
 }
 void SignalLog(const int side,const MqlRates &candle,const double mid,const double upper,const double lower,
                const double k,const double atr_value)
@@ -504,22 +1029,22 @@ void SignalLog(const int side,const MqlRates &candle,const double mid,const doub
          market=StringFormat("mercado_disponible=true mercado_tick=%s mercado_bid=%.5f mercado_ask=%.5f mercado_referencia_e1=%.5f",
                 TimeToString(quote.time,TIME_DATE|TIME_SECONDS),quote.bid,quote.ask,side>0 ? quote.ask : quote.bid);
       Log("SIGNAL",StringFormat("modo=CLOSED_BAR evaluacion=%s vela=%s cierre_nominal=%s segundos_desde_cierre=%I64d direccion=%s "
-          "Open=%.5f High=%.5f Low=%.5f Close=%.5f LowerBand=%.10f SMA20=%.10f UpperBand=%.10f K=%.10f ATR=%.10f cierre_dentro_bandas=%s %s",
+          "Open=%.5f High=%.5f Low=%.5f Close=%.5f LowerBand=%.10f SMA20=%.10f UpperBand=%.10f %s ATR=%.10f cierre_dentro_bandas=%s %s",
           TimeToString(evaluated,TIME_DATE|TIME_SECONDS),TimeToString(candle.time,TIME_DATE|TIME_SECONDS),
           TimeToString(nominal_close,TIME_DATE|TIME_SECONDS),elapsed,side>0 ? "BUY" : "SELL",
-          candle.open,candle.high,candle.low,candle.close,lower,mid,upper,k,atr_value,inside ? "true" : "false",market));
+          candle.open,candle.high,candle.low,candle.close,lower,mid,upper,OscillatorSnapshot(k,1),atr_value,inside ? "true" : "false",market));
       return;
    }
-   Log("SIGNAL",StringFormat("modo=%s vela=%s direccion=%s precio=%.5f low=%.5f high=%.5f BB=%.5f/%.5f/%.5f K=%.5f ATR=%.5f",
+   Log("SIGNAL",StringFormat("modo=%s vela=%s direccion=%s precio=%.5f low=%.5f high=%.5f BB=%.5f/%.5f/%.5f %s ATR=%.5f",
        InpSignalMode==INTRABAR ? "INTRABAR" : "CLOSED_BAR",TimeToString(candle.time,TIME_DATE|TIME_SECONDS),
-       side>0 ? "BUY" : "SELL",candle.close,candle.low,candle.high,lower,mid,upper,k,atr_value));
+       side>0 ? "BUY" : "SELL",candle.close,candle.low,candle.high,lower,mid,upper,OscillatorSnapshot(k,0),atr_value));
 }
 void EvaluateClosedBarSignal()
 {
    MqlRates candle[1];
    double mid,upper,lower,k,atr_value;
    if(iTime(_Symbol,PERIOD_M5,0)!=g_last_signal_bar || CopyRates(_Symbol,PERIOD_M5,1,1,candle)!=1 ||
-      candle[0].time>=g_last_signal_bar || !Bands(1,mid,upper,lower) || !Value(stoch,0,1,k) ||
+      candle[0].time>=g_last_signal_bar || !Bands(1,mid,upper,lower) || !Value(oscillator_handle,0,1,k) ||
       !Value(atr_handle,0,1,atr_value))
    {
       Log("REJECTED","modo=CLOSED_BAR nueva_vela="+TimeToString(g_last_signal_bar,TIME_DATE|TIME_SECONDS)+
@@ -544,7 +1069,306 @@ void EvaluateClosedBarSignal()
    TrackCurrent();
    if(state==CLOSING_IDEA) CloseStep();
 }
-bool ATRAllowed(const double value) { return value>0 && value<=InpATRMax; }
+bool ValidBBWInputs(const double mid,const double upper,const double lower)
+{
+   return MathIsValidNumber(mid) && MathIsValidNumber(upper) && MathIsValidNumber(lower) &&
+          mid!=EMPTY_VALUE && upper!=EMPTY_VALUE && lower!=EMPTY_VALUE && mid>0 && upper>=lower;
+}
+bool ConfirmReentryBBWP70(const int side,const datetime candle,const double mid1,const double upper1,const double lower1)
+{
+   double reference[100],sorted[100];
+   datetime newest=0,oldest=0,previous=candle;
+   string reason="";
+   int count=0;
+   bool valid=ValidBBWInputs(mid1,upper1,lower1);
+   double bbw1=0;
+   if(valid) { bbw1=(upper1-lower1)/mid1; valid=MathIsValidNumber(bbw1); }
+   if(!valid) reason="BBW1_invalido";
+   if(valid)
+   {
+      for(int shift=2;shift<=101;shift++)
+      {
+         double mid,upper,lower;
+         datetime bar=iTime(_Symbol,PERIOD_M5,shift);
+         if(bar==0 || bar>=previous || !Bands(shift,mid,upper,lower))
+         { reason=StringFormat("datos_referencia_no_disponibles_shift_%d",shift); valid=false; break; }
+         if(!ValidBBWInputs(mid,upper,lower))
+         { reason=StringFormat("datos_referencia_invalidos_shift_%d",shift); valid=false; break; }
+         double value=(upper-lower)/mid;
+         if(!MathIsValidNumber(value))
+         { reason=StringFormat("BBW_no_finito_shift_%d",shift); valid=false; break; }
+         reference[count]=value;
+         if(count==0) newest=bar;
+         oldest=bar; previous=bar; count++;
+      }
+   }
+   if(!valid)
+   {
+      Log("BBW_FILTER",StringFormat("modo=BBW_BELOW_P70 direccion=%s vela1=%s BBW1=%s referencia_inicio=%s referencia_fin=%s valores=%d requeridos=100 P70=n/a resultado=DESCARTADA motivo=%s",
+          side>0 ? "BUY" : "SELL",TimeToString(candle,TIME_DATE|TIME_SECONDS),
+          reason=="BBW1_invalido" ? "n/a" : StringFormat("%.17g",bbw1),
+          oldest==0 ? "n/a" : TimeToString(oldest,TIME_DATE|TIME_SECONDS),
+          newest==0 ? "n/a" : TimeToString(newest,TIME_DATE|TIME_SECONDS),count,reason),true);
+      return false;
+   }
+   // Sort a copy of exactly BBW[2..101], never including the signal candle.
+   for(int i=0;i<100;i++) sorted[i]=reference[i];
+   for(int i=1;i<100;i++)
+   {
+      double item=sorted[i]; int j=i-1;
+      while(j>=0 && sorted[j]>item) { sorted[j+1]=sorted[j]; j--; }
+      sorted[j+1]=item;
+   }
+   double p70=sorted[69]; // nearest rank 70 of 100; no interpolation or rounding.
+   bool allowed=bbw1<p70;
+   Log("BBW_FILTER",StringFormat("modo=BBW_BELOW_P70 direccion=%s vela1=%s BBW1=%.17g referencia_inicio=%s referencia_fin=%s valores=100 P70=%.17g resultado=%s motivo=%s",
+       side>0 ? "BUY" : "SELL",TimeToString(candle,TIME_DATE|TIME_SECONDS),bbw1,
+       TimeToString(oldest,TIME_DATE|TIME_SECONDS),TimeToString(newest,TIME_DATE|TIME_SECONDS),p70,
+       allowed ? "PERMITIDA" : "DESCARTADA",allowed ? "BBW1_menor_P70" : "BBW1_no_menor_P70"),true);
+   return allowed;
+}
+bool ConfirmReentryBBW(const int side,const datetime candle,const double mid1,const double upper1,const double lower1)
+{
+   if(InpStrategy!=BB_REENTRY || !InpReentryBBWFilter) return true;
+   if(InpReentryBBWMode==BBW_BELOW_P70) return ConfirmReentryBBWP70(side,candle,mid1,upper1,lower1);
+   double mid2=0,upper2=0,lower2=0;
+   datetime previous=iTime(_Symbol,PERIOD_M5,2);
+   string first=StringFormat("vela1=%s Upper1=%.17g Lower1=%.17g SMA1=%.17g",
+       TimeToString(candle,TIME_DATE|TIME_SECONDS),upper1,lower1,mid1);
+   if(previous==0 || previous>=candle || !Bands(2,mid2,upper2,lower2))
+   {
+      Log("BBW_FILTER",StringFormat("direccion=%s %s vela2=%s Upper2=n/a Lower2=n/a SMA2=n/a BBW1=n/a BBW2=n/a resultado=DESCARTADA motivo=datos_vela2_no_disponibles",
+          side>0 ? "BUY" : "SELL",first,previous==0 ? "n/a" : TimeToString(previous,TIME_DATE|TIME_SECONDS)),true);
+      return false;
+   }
+   string snapshot=first+StringFormat(" vela2=%s Upper2=%.17g Lower2=%.17g SMA2=%.17g",
+       TimeToString(previous,TIME_DATE|TIME_SECONDS),upper2,lower2,mid2);
+   if(!ValidBBWInputs(mid1,upper1,lower1) || !ValidBBWInputs(mid2,upper2,lower2))
+   {
+      Log("BBW_FILTER",StringFormat("direccion=%s %s BBW1=n/a BBW2=n/a resultado=DESCARTADA motivo=datos_invalidos_SMA_no_positiva_o_bandas_invertidas",
+          side>0 ? "BUY" : "SELL",snapshot),true);
+      return false;
+   }
+   double bbw1=(upper1-lower1)/mid1,bbw2=(upper2-lower2)/mid2;
+   bool finite=MathIsValidNumber(bbw1) && MathIsValidNumber(bbw2);
+   bool allowed=finite && bbw1<=bbw2; // Compare unrounded values; equality is allowed.
+   Log("BBW_FILTER",StringFormat("direccion=%s %s BBW1=%.17g BBW2=%.17g resultado=%s motivo=%s",
+       side>0 ? "BUY" : "SELL",snapshot,bbw1,bbw2,allowed ? "PERMITIDA" : "DESCARTADA",
+       !finite ? "BBW_no_finito" : (allowed ? "ancho_no_aumenta" : "ancho_aumenta")),true);
+   return allowed;
+}
+string ReentryADXModeName()
+{
+   if(InpReentryADXMode==ADX_BELOW_25) return "ADX_BELOW_25";
+   if(InpReentryADXMode==ADX_BELOW_20) return "ADX_BELOW_20";
+   if(InpReentryADXMode==ADX_BELOW_25_FALLING) return "ADX_BELOW_25_FALLING";
+   return "ADX_OFF";
+}
+bool ConfirmReentryADX(const int side,const datetime candle)
+{
+   if(InpStrategy!=BB_REENTRY || InpReentryADXMode==ADX_OFF) return true;
+   double adx1=0,adx2=0;
+   string snapshot="ADX1=n/a";
+   bool falling=InpReentryADXMode==ADX_BELOW_25_FALLING;
+   if(!Value(adx_handle,0,1,adx1))
+   {
+      Log("ADX_FILTER",StringFormat("direccion=%s vela_reingreso=%s modo=%s ADX1=n/a resultado=DESCARTADA motivo=datos_ADX1_no_disponibles",
+          side>0 ? "BUY" : "SELL",TimeToString(candle,TIME_DATE|TIME_SECONDS),ReentryADXModeName()),true);
+      return false;
+   }
+   snapshot=StringFormat("ADX1=%.10f",adx1);
+   if(falling)
+   {
+      if(!Value(adx_handle,0,2,adx2))
+      {
+         Log("ADX_FILTER",StringFormat("direccion=%s vela_reingreso=%s modo=%s %s ADX2=n/a resultado=DESCARTADA motivo=datos_ADX2_no_disponibles",
+             side>0 ? "BUY" : "SELL",TimeToString(candle,TIME_DATE|TIME_SECONDS),ReentryADXModeName(),snapshot),true);
+         return false;
+      }
+      snapshot+=StringFormat(" ADX2=%.10f",adx2);
+   }
+   double limit=InpReentryADXMode==ADX_BELOW_20 ? 20.0 : 25.0;
+   bool allowed=adx1<limit;
+   string reason=allowed ? "umbral_cumplido" : "umbral_no_cumplido";
+   if(falling && allowed) { allowed=adx1<adx2; reason=allowed ? "umbral_y_descenso" : "sin_descenso_estricto"; }
+   Log("ADX_FILTER",StringFormat("direccion=%s vela_reingreso=%s modo=%s %s resultado=%s motivo=%s",
+       side>0 ? "BUY" : "SELL",TimeToString(candle,TIME_DATE|TIME_SECONDS),ReentryADXModeName(),snapshot,
+       allowed ? "PERMITIDA" : "DESCARTADA",reason),true);
+   return allowed;
+}
+bool ConfirmReentryMACD(const int side,const datetime exterior,const datetime candle)
+{
+   if(InpStrategy!=BB_REENTRY || !InpReentryMACDConfirm) return true;
+   double main1,signal1,main2,signal2;
+   if(!Value(macd_handle,0,1,main1) || !Value(macd_handle,1,1,signal1) ||
+      !Value(macd_handle,0,2,main2) || !Value(macd_handle,1,2,signal2))
+   {
+      Log("MACD_CONFIRM",StringFormat("direccion=%s vela_exterior=%s vela_reingreso=%s MAIN1=n/a SIGNAL1=n/a H1=n/a H2=n/a resultado=DESCARTADA datos_MACD=no_disponibles; sin reintento tardio",
+          side>0 ? "BUY" : "SELL",TimeToString(exterior,TIME_DATE|TIME_SECONDS),TimeToString(candle,TIME_DATE|TIME_SECONDS)),true);
+      return false;
+   }
+   // MT5 draws MAIN_LINE as bars; H here is explicitly MAIN minus SIGNAL.
+   double h1=main1-signal1,h2=main2-signal2;
+   bool confirmed=MathIsValidNumber(h1) && MathIsValidNumber(h2) &&
+       (side>0 ? h1<0 && h1>h2 : h1>0 && h1<h2);
+   Log("MACD_CONFIRM",StringFormat("direccion=%s vela_exterior=%s vela_reingreso=%s MAIN1=%.10f SIGNAL1=%.10f H1=%.10f H2=%.10f resultado=%s",
+       side>0 ? "BUY" : "SELL",TimeToString(exterior,TIME_DATE|TIME_SECONDS),TimeToString(candle,TIME_DATE|TIME_SECONDS),
+       main1,signal1,h1,h2,confirmed ? "CONFIRMADA" : "DESCARTADA"),true);
+   return confirmed;
+}
+void EvaluateReentrySignal()
+{
+   MqlRates candle[1];
+   double mid,upper,lower,atr_value;
+   if(iTime(_Symbol,PERIOD_M5,0)!=g_last_signal_bar || CopyRates(_Symbol,PERIOD_M5,1,1,candle)!=1)
+   {
+      Log("REJECTED","estrategia=BB_REENTRY serie M5 no disponible; oportunidad descartada",true);
+      ClearReentry("datos de velas no disponibles");
+      return;
+   }
+   if(candle[0].time+PeriodSeconds(PERIOD_M5)!=g_last_signal_bar)
+   {
+      Log("REJECTED",StringFormat("estrategia=BB_REENTRY vela=%s nueva_vela=%s sin continuidad; oportunidad descartada",
+          TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),TimeToString(g_last_signal_bar,TIME_DATE|TIME_SECONDS)),true);
+      ClearReentry("pausa de sesion o datos");
+      return;
+   }
+   if(!Bands(1,mid,upper,lower) || !Value(atr_handle,0,1,atr_value))
+   {
+      Log("REJECTED","estrategia=BB_REENTRY indicadores no disponibles; oportunidad descartada",true);
+      ClearReentry("indicadores no disponibles");
+      return;
+   }
+   if(InpReentryBBWFilter && !ValidBBWInputs(mid,upper,lower))
+   {
+      Log("REJECTED","BBW datos vela1 invalidos; preparacion descartada",true);
+      ClearReentry("datos Bollinger invalidos para BBW");
+      return;
+   }
+   ReentryState outside=NONE;
+   if(candle[0].close<lower) outside=WAIT_BUY_REENTRY;
+   else if(candle[0].close>upper) outside=WAIT_SELL_REENTRY;
+   if(outside!=NONE)
+   {
+      if(outside!=reentry_state)
+      {
+         ClearReentry("sustitucion por cierre exterior opuesto");
+         reentry_state=outside;
+         reentry_outer_bar=candle[0].time;
+         Log("PREPARATION",StringFormat("estrategia=BB_REENTRY direccion=%s vela=%s Close=%.10f LowerBand=%.10f UpperBand=%.10f",
+             outside==WAIT_BUY_REENTRY ? "BUY" : "SELL",TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),candle[0].close,lower,upper));
+      }
+      return;
+   }
+   if(reentry_state==NONE || candle[0].time<=reentry_outer_bar || candle[0].close<=lower || candle[0].close>=upper) return;
+   int side=reentry_state==WAIT_BUY_REENTRY ? 1 : -1;
+   datetime exterior=reentry_outer_bar;
+   ClearReentry(InpReentryMACDConfirm ? "primer cierre interior; preparacion consumida" : "reingreso confirmado; preparacion consumida");
+   bool macd_ok=ConfirmReentryMACD(side,exterior,candle[0].time);
+   bool adx_ok=ConfirmReentryADX(side,candle[0].time);
+   bool bbw_ok=ConfirmReentryBBW(side,candle[0].time,mid,upper,lower);
+   if(!macd_ok || !adx_ok || !bbw_ok) return;
+   if((side>0 && processed_buy==candle[0].time) || (side<0 && processed_sell==candle[0].time)) return;
+   if(side>0) processed_buy=candle[0].time;
+   else processed_sell=candle[0].time;
+   if(!SaveSignal()) return;
+   Log("SIGNAL",StringFormat("estrategia=BB_REENTRY modo=CLOSED_BAR direccion=%s vela_exterior=%s vela=%s Close=%.10f LowerBand=%.10f UpperBand=%.10f SMA20=%.10f ATR=%.10f shift=1",
+       side>0 ? "BUY" : "SELL",TimeToString(exterior,TIME_DATE|TIME_SECONDS),TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),
+       candle[0].close,lower,upper,mid,atr_value));
+   OpenIdea(side,atr_value,mid,upper,lower);
+   TrackCurrent();
+   if(state==CLOSING_IDEA) CloseStep();
+}
+void EvaluateATRDeviationSignal()
+{
+   MqlRates candle[1]; double sma,atr_value;
+   if(iTime(_Symbol,PERIOD_M5,0)!=g_last_signal_bar || CopyRates(_Symbol,PERIOD_M5,1,1,candle)!=1 ||
+      !Value(sma_handle,0,1,sma) || !Value(atr_handle,0,1,atr_value))
+   { Log("REJECTED","estrategia=ATR_DEVIATION_REENTRY datos no disponibles; oportunidad descartada",true); ClearReentry("datos no disponibles"); return; }
+   if(candle[0].time+PeriodSeconds(PERIOD_M5)!=g_last_signal_bar)
+   { Log("REJECTED","estrategia=ATR_DEVIATION_REENTRY discontinuidad; oportunidad descartada",true); ClearReentry("discontinuidad de barras"); return; }
+   if(!MathIsValidNumber(candle[0].close) || candle[0].close==EMPTY_VALUE || candle[0].close<=0 ||
+      !MathIsValidNumber(sma) || sma==EMPTY_VALUE || sma<=0 || !MathIsValidNumber(atr_value) || atr_value==EMPTY_VALUE || atr_value<=0)
+   { Log("REJECTED","estrategia=ATR_DEVIATION_REENTRY Close/SMA/ATR invalidos",true); ClearReentry("datos invalidos"); return; }
+   double d=(candle[0].close-sma)/atr_value,t=InpATRDeviationThreshold;
+   if(!MathIsValidNumber(d)) { Log("REJECTED","estrategia=ATR_DEVIATION_REENTRY D no finito",true); ClearReentry("D invalido"); return; }
+   ReentryState outside=NONE;
+   if(d<-t) outside=WAIT_BUY_REENTRY;
+   else if(d>t) outside=WAIT_SELL_REENTRY;
+   if(outside!=NONE)
+   {
+      if(outside!=reentry_state)
+      {
+         ClearReentry("sustitucion por extremo opuesto");
+         reentry_state=outside; reentry_outer_bar=candle[0].time;
+         deviation_prep_close=candle[0].close; deviation_prep_sma=sma; deviation_prep_atr=atr_value; deviation_prep_d=d;
+         Log("PREPARATION",StringFormat("estrategia=ATR_DEVIATION_REENTRY direccion=%s vela=%s Close=%.17g SMA20=%.17g ATR14=%.17g D=%.17g",
+             outside==WAIT_BUY_REENTRY ? "BUY" : "SELL",TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),candle[0].close,sma,atr_value,d));
+      }
+      return;
+   }
+   if((reentry_state==WAIT_BUY_REENTRY && d>=0) || (reentry_state==WAIT_SELL_REENTRY && d<=0))
+   { ClearReentry("media alcanzada o cruzada sin confirmacion"); return; }
+   bool buy=reentry_state==WAIT_BUY_REENTRY && -t<d && d<0;
+   bool sell=reentry_state==WAIT_SELL_REENTRY && 0<d && d<t;
+   if((!buy && !sell) || candle[0].time<=reentry_outer_bar) return;
+   int side=buy ? 1 : -1;
+   datetime prepared=reentry_outer_bar;
+   double pc=deviation_prep_close,ps=deviation_prep_sma,pa=deviation_prep_atr,pd=deviation_prep_d;
+   ClearReentry("confirmacion consumida");
+   if((side>0 && processed_buy==candle[0].time) || (side<0 && processed_sell==candle[0].time)) return;
+   if(side>0) processed_buy=candle[0].time; else processed_sell=candle[0].time;
+   if(!SaveSignal()) return;
+   MqlTick quote={}; string market="mercado_disponible=false";
+   if(SymbolInfoTick(_Symbol,quote)) market=StringFormat("mercado_disponible=true mercado_bid=%.10f mercado_ask=%.10f mercado_referencia_e1=%.10f",quote.bid,quote.ask,side>0 ? quote.ask : quote.bid);
+   Log("SIGNAL",StringFormat("estrategia=ATR_DEVIATION_REENTRY evaluacion=%s direccion=%s preparacion=%s confirmacion=%s shift=1 Close_preparacion=%.17g SMA_preparacion=%.17g ATR_preparacion=%.17g D_preparacion=%.17g Close_confirmacion=%.17g SMA_confirmacion=%.17g ATR_confirmacion=%.17g D_confirmacion=%.17g cambio_Close=%.17g cambio_SMA=%.17g cambio_ATR=%.17g %s",
+       TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),side>0 ? "BUY" : "SELL",TimeToString(prepared,TIME_DATE|TIME_SECONDS),TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),
+       pc,ps,pa,pd,candle[0].close,sma,atr_value,d,candle[0].close-pc,sma-ps,atr_value-pa,market));
+   OpenIdea(side,atr_value,sma,0,0);
+   TrackCurrent(); if(state==CLOSING_IDEA) CloseStep();
+}
+int WickSignalSide(const MqlRates &candle,const double mid,const double upper,const double lower)
+{
+   if(!ValidBBWInputs(mid,upper,lower) || !MathIsValidNumber(candle.open) || !MathIsValidNumber(candle.close) ||
+      !MathIsValidNumber(candle.high) || !MathIsValidNumber(candle.low) || candle.open==EMPTY_VALUE ||
+      candle.close==EMPTY_VALUE || candle.high==EMPTY_VALUE || candle.low==EMPTY_VALUE || candle.low<=0 ||
+      candle.high<=candle.low || candle.open<candle.low || candle.open>candle.high ||
+      candle.close<candle.low || candle.close>candle.high) return -2;
+   double range=candle.high-candle.low;
+   if(!MathIsValidNumber(range)) return -2;
+   if(candle.close<=lower || candle.close>=upper) return 0;
+   bool buy=candle.low<=lower && (MathMin(candle.open,candle.close)-candle.low)/range>=InpWickMinRatio;
+   bool sell=candle.high>=upper && (candle.high-MathMax(candle.open,candle.close))/range>=InpWickMinRatio;
+   if(buy && sell) return 2;
+   return buy ? 1 : (sell ? -1 : 0);
+}
+void EvaluateWickSignal()
+{
+   MqlRates candle[1]; double mid,upper,lower,atr_value;
+   if(iTime(_Symbol,PERIOD_M5,0)!=g_last_signal_bar || CopyRates(_Symbol,PERIOD_M5,1,1,candle)!=1 ||
+      !Bands(1,mid,upper,lower) || !Value(atr_handle,0,1,atr_value))
+   { Log("REJECTED","estrategia=BB_WICK_REJECTION datos no disponibles; oportunidad descartada",true); return; }
+   if(candle[0].time+PeriodSeconds(PERIOD_M5)!=g_last_signal_bar)
+   { Log("REJECTED","estrategia=BB_WICK_REJECTION vela antigua sin continuidad; oportunidad descartada",true); return; }
+   int side=WickSignalSide(candle[0],mid,upper,lower);
+   if(side==-2) { Log("REJECTED","estrategia=BB_WICK_REJECTION OHLC/Bollinger invalidos o rango no positivo",true); return; }
+   if(side==2) { Log("AMBIGUOUS_SIGNAL","estrategia=BB_WICK_REJECTION vela="+TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS)+" compra y venta; ambas descartadas",true); return; }
+   if(side==0 || (side>0 && processed_buy==candle[0].time) || (side<0 && processed_sell==candle[0].time)) return;
+   if(side>0) processed_buy=candle[0].time; else processed_sell=candle[0].time;
+   if(!SaveSignal()) return;
+   double range=candle[0].high-candle[0].low,body=MathAbs(candle[0].close-candle[0].open);
+   double bottom=MathMin(candle[0].open,candle[0].close)-candle[0].low;
+   double top=candle[0].high-MathMax(candle[0].open,candle[0].close);
+   string distance=atr_value>0 ? StringFormat("%.17g",(side>0 ? candle[0].close-lower : upper-candle[0].close)/atr_value) : "n/a";
+   MqlTick quote={}; string market="mercado_disponible=false";
+   if(SymbolInfoTick(_Symbol,quote)) market=StringFormat("mercado_disponible=true mercado_bid=%.10f mercado_ask=%.10f mercado_referencia_e1=%.10f",quote.bid,quote.ask,side>0 ? quote.ask : quote.bid);
+   Log("SIGNAL",StringFormat("estrategia=BB_WICK_REJECTION evaluacion=%s vela=%s direccion=%s shift=1 Open=%.10f High=%.10f Low=%.10f Close=%.10f LowerBand=%.10f SMA20=%.10f UpperBand=%.10f ATR=%.10f rango=%.17g cuerpo=%.17g mecha_inferior=%.17g mecha_superior=%.17g ratio_inferior=%.17g ratio_superior=%.17g cuerpo_rango=%.17g distancia_cierre_ATR=%s %s",
+       TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),TimeToString(candle[0].time,TIME_DATE|TIME_SECONDS),side>0 ? "BUY" : "SELL",
+       candle[0].open,candle[0].high,candle[0].low,candle[0].close,lower,mid,upper,atr_value,range,body,bottom,top,bottom/range,top/range,body/range,distance,market));
+   OpenIdea(side,atr_value,mid,upper,lower);
+   TrackCurrent(); if(state==CLOSING_IDEA) CloseStep();
+}
+bool ATRAllowed(const double value) { return value>0 && value<=(InpStrategy==BB_REENTRY ? 8.0 : InpATRMax); }
 void OpenIdea(const int side,const double atr_value,const double mid,const double upper,const double lower)
 {
    direction=side; frozen_atr=atr_value;
@@ -553,10 +1377,12 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
    if(!Size(side>0 ? q.ask : q.bid,lot)) { Log("REJECTED","Calculo de riesgo o lote insuficiente"); return; }
    CheckOwnership();
    if(manual_required || !history_ok || ForeignExposure() || OwnPositions()>0 || OwnOrders()>0) return;
+   ClearReentry("inicio de idea");
    idea_start=TimeCurrent(); realized=0; entries=0; e1_order=0; e2_order=0; had_exposure=false;
    ArrayResize(position_ids,0);
    ResetExcursions();
-   target=Target(mid,upper,lower); tp_bar=iTime(_Symbol,PERIOD_M5,0);
+   ResetHalfExit();
+   target=(InpStrategy==BB_REENTRY && (InpReentryExitMode==EXIT_ATR_FIXED_2 || InpReentryExitMode==EXIT_HALF_SMA20_DYNAMIC || InpReentryExitMode==EXIT_OPPOSITE_BAND_DYNAMIC)) ? 0 : Target(mid,upper,lower); tp_bar=iTime(_Symbol,PERIOD_M5,0);
    state=ACTIVE_IDEA;
    // FOK when available; otherwise IOC, with partial execution handled by abort.
    long filling=SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
@@ -578,18 +1404,32 @@ void OpenIdea(const int side,const double atr_value,const double mid,const doubl
       if(PositionOwner(t)!=1 || !PositionSelectByTicket(t)) continue;
       double v=PositionGetDouble(POSITION_VOLUME);
       executed+=v; entry_price+=v*PositionGetDouble(POSITION_PRICE_OPEN);
+      if(HalfExitMode()) g_half.position_id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
    }
    if(executed>0) entry_price/=executed;
    if(entry_price<=0 || MathAbs(executed-lot)>volume_step*0.1)
    { Abort("E1 volumen parcial o precio desconocido"); return; }
    entries=1; had_exposure=true;
+   if(HalfExitMode()) g_half.initial_volume=executed;
    double e2,risk;
    Levels(entry_price,e2,g_sl);
    if(!Risk(executed,entry_price,e2,g_sl,risk) || risk>Budget())
    { Abort("Riesgo real excedido o calculo fallido"); return; }
+   if(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2)
+      target=Price(entry_price+direction*2.0*frozen_atr);
+   else if(InpStrategy==BB_REENTRY && (InpReentryExitMode==EXIT_HALF_SMA20_DYNAMIC || InpReentryExitMode==EXIT_OPPOSITE_BAND_DYNAMIC))
+      target=Target(mid,upper,lower);
    if(!SetInitialSL()) { Abort("No se pudo establecer SL valido"); return; }
    if(!SymbolInfoTick(_Symbol,q)) { Abort("Sin cotizacion despues de E1"); return; }
+   if(InpStrategy==BB_REENTRY)
+      Log("ENTRY",StringFormat("estrategia=BB_REENTRY salida=%s E1=%.5f E1_orden=%I64u ATR_congelado=%.10f lote=%.8f SL=%.5f TP=%.5f riesgo=%.2f SL_ATR=%.10f entradas=1",
+          InpReentryExitMode==EXIT_ATR_FIXED_2 ? "EXIT_ATR_FIXED_2" : (InpReentryExitMode==EXIT_HALF_SMA20_DYNAMIC ? "EXIT_HALF_SMA20_DYNAMIC" : (InpReentryExitMode==EXIT_OPPOSITE_BAND_DYNAMIC ? "EXIT_OPPOSITE_BAND_DYNAMIC" : (InpReentryExitMode==EXIT_HALF_SMA20_TRAIL_ATR ? "EXIT_HALF_SMA20_TRAIL_ATR" : "EXIT_SMA20_DYNAMIC"))),entry_price,e1_order,frozen_atr,lot,g_sl,target,risk,InpReentrySLATR),true);
+   else if(InpStrategy!=ORIGINAL)
+      Log("ENTRY",StringFormat("estrategia=%s E1=%.5f E1_orden=%I64u lote=%.8f SL=%.5f TP=%.5f riesgo=%.2f SL_ATR=%.10f entradas=1",
+          InpStrategy==BB_REENTRY ? "BB_REENTRY" : (InpStrategy==BB_WICK_REJECTION ? "BB_WICK_REJECTION" : "ATR_DEVIATION_REENTRY"),entry_price,e1_order,lot,g_sl,target,risk,InpReentrySLATR),true);
+   if(HalfExitMode()) { HalfExitStep(); return; }
    if(HitTarget(q)) { BeginClose("TP inicial alcanzado"); return; }
+   if(InpStrategy!=ORIGINAL) return; // E1 is the only entry; no pending order.
    if(direction>0 ? q.ask-e2<StopDistance() || e2>=q.ask : e2-q.bid<StopDistance() || e2<=q.bid)
    { Abort("E2 stops invalidos"); return; }
    double tp=ValidTP(q) ? target : 0;
@@ -665,7 +1505,7 @@ void InspectIdeaHistory()
       if(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY || entry==DEAL_ENTRY_INOUT)
       {
          realized+=HistoryDealGetDouble(d,DEAL_PROFIT)+HistoryDealGetDouble(d,DEAL_SWAP);
-         if(state==ACTIVE_IDEA) BeginClose("Cierre detectado en historial de la idea");
+         if(state==ACTIVE_IDEA && !IgnoreHalfDeal(d)) BeginClose("Cierre detectado en historial de la idea");
       }
       if(order==e1_order && entry==DEAL_ENTRY_IN) e1_seen=true;
       if(order==e2_order && e2_order!=0 && entry==DEAL_ENTRY_IN)
@@ -1009,11 +1849,27 @@ int OnInit()
    { Print("INIT_FAILED: cuenta del probador debe estar denominada en USD"); return INIT_PARAMETERS_INCORRECT; }
    if(_Period!=PERIOD_M5 || StringFind(_Symbol,"XAUUSD")<0)
    { Print("INIT_FAILED: utilizar XAUUSD (se admiten prefijos/sufijos) en M5"); return INIT_PARAMETERS_INCORRECT; }
-   if((InpSignalMode!=INTRABAR && InpSignalMode!=CLOSED_BAR) || InpMagicNumber==0 || !MathIsValidNumber(InpRiskBaseUSD) || InpRiskBaseUSD<=0 ||
+   if((InpStrategy!=ORIGINAL && InpStrategy!=BB_REENTRY && InpStrategy!=BB_WICK_REJECTION && InpStrategy!=ATR_DEVIATION_REENTRY) || InpMagicNumber==0 ||
+      !MathIsValidNumber(InpRiskBaseUSD) || InpRiskBaseUSD<=0 ||
       !MathIsValidNumber(InpRiskPercent) || InpRiskPercent<=0 || InpRiskPercent>100 ||
-      InpBollingerPeriod<2 || !MathIsValidNumber(InpBollingerDeviation) || InpBollingerDeviation<=0 ||
-      InpStochasticK<1 || InpStochasticD<1 || InpStochasticSlowing<1 || InpATRPeriod<1 ||
-      !MathIsValidNumber(InpATRMax) || InpATRMax<=0 || !MathIsValidNumber(InpTPFactor) || InpTPFactor<=0 || InpTPFactor>1)
+      (InpStrategy==BB_REENTRY && InpReentryExitMode!=EXIT_SMA20_DYNAMIC && InpReentryExitMode!=EXIT_ATR_FIXED_2 && InpReentryExitMode!=EXIT_HALF_SMA20_DYNAMIC && InpReentryExitMode!=EXIT_OPPOSITE_BAND_DYNAMIC && InpReentryExitMode!=EXIT_HALF_SMA20_TRAIL_ATR) ||
+      (InpStrategy==BB_REENTRY && InpReentryBBWFilter && InpReentryBBWMode!=BBW_NON_INCREASING && InpReentryBBWMode!=BBW_BELOW_P70) ||
+      (InpStrategy==BB_REENTRY && InpReentryADXMode!=ADX_OFF && InpReentryADXMode!=ADX_BELOW_25 &&
+       InpReentryADXMode!=ADX_BELOW_20 && InpReentryADXMode!=ADX_BELOW_25_FALLING) ||
+      (InpStrategy==BB_REENTRY && InpReentryMACDConfirm && (InpMACDFast<=0 || InpMACDSlow<=0 || InpMACDSignal<=0 || InpMACDFast>=InpMACDSlow)) ||
+      (WeekendGuardEnabled() && (InpWeekendCloseMinutes<=0 || InpWeekendEntryBlockMinutes<InpWeekendCloseMinutes)) ||
+      (InpStrategy==ATR_DEVIATION_REENTRY && (!MathIsValidNumber(InpATRDeviationThreshold) || InpATRDeviationThreshold<=0 || !MathIsValidNumber(InpATRMax) || InpATRMax<=0)) ||
+      (InpStrategy==BB_WICK_REJECTION && (!MathIsValidNumber(InpWickMinRatio) || InpWickMinRatio<=0 || InpWickMinRatio>1 || !MathIsValidNumber(InpATRMax) || InpATRMax<=0)) ||
+      (InpStrategy!=ORIGINAL && (!MathIsValidNumber(InpReentrySLATR) || InpReentrySLATR<=0)) ||
+      (InpStrategy==ORIGINAL && (
+       (InpSignalMode!=INTRABAR && InpSignalMode!=CLOSED_BAR) ||
+       InpBollingerPeriod<2 || !MathIsValidNumber(InpBollingerDeviation) || InpBollingerDeviation<=0 ||
+       (InpOscillator!=STOCHASTIC && InpOscillator!=RSI) ||
+       (InpOscillator==STOCHASTIC && (InpStochasticK<1 || InpStochasticD<1 || InpStochasticSlowing<1)) ||
+       (InpOscillator==RSI && (InpRSIPeriod<=0 || !MathIsValidNumber(InpRSIBuyLevel) ||
+        !MathIsValidNumber(InpRSISellLevel) || InpRSIBuyLevel<=0 || InpRSIBuyLevel>=InpRSISellLevel || InpRSISellLevel>=100)) ||
+       InpATRPeriod<1 || !MathIsValidNumber(InpATRMax) || InpATRMax<=0 ||
+       !MathIsValidNumber(InpTPFactor) || InpTPFactor<=0 || InpTPFactor>1)))
    { Print("INIT_FAILED: parametros invalidos"); return INIT_PARAMETERS_INCORRECT; }
    tick_size=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
    volume_min=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
@@ -1022,7 +1878,14 @@ int OnInit()
    if(tick_size<=0 || volume_min<=0 || volume_step<=0 || volume_max<volume_min || !MathIsValidNumber(Budget()) || Budget()<=0)
       return INIT_FAILED;
    signal_key=SignalKey();
-   if(InpSignalMode==CLOSED_BAR) signal_key+="C.";
+   if(InpStrategy==ATR_DEVIATION_REENTRY) signal_key+="ATRDEV.";
+   else if(InpStrategy==BB_WICK_REJECTION) signal_key+="WICK.";
+   else if(InpStrategy==BB_REENTRY) signal_key+="BB.";
+   else
+   {
+      if(InpSignalMode==CLOSED_BAR) signal_key+="C.";
+      if(InpOscillator==RSI) signal_key+="R.";
+   }
    if(GlobalVariableCheck(signal_key+"B")) processed_buy=(datetime)GlobalVariableGet(signal_key+"B");
    if(GlobalVariableCheck(signal_key+"S")) processed_sell=(datetime)GlobalVariableGet(signal_key+"S");
    netting=(ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
@@ -1030,11 +1893,52 @@ int OnInit()
    trade.SetDeviationInPoints(InpDeviationPoints);
    trade.SetAsyncMode(false);
    trade.SetMarginMode();
-   bands=iBands(_Symbol,PERIOD_M5,InpBollingerPeriod,0,InpBollingerDeviation,PRICE_CLOSE);
-   stoch=iStochastic(_Symbol,PERIOD_M5,InpStochasticK,InpStochasticD,InpStochasticSlowing,MODE_SMA,STO_LOWHIGH);
-   atr_handle=iATR(_Symbol,PERIOD_M5,InpATRPeriod);
-   if(bands==INVALID_HANDLE || stoch==INVALID_HANDLE || atr_handle==INVALID_HANDLE) return INIT_FAILED;
+   if(InpStrategy==ATR_DEVIATION_REENTRY)
+      sma_handle=iMA(_Symbol,PERIOD_M5,20,0,MODE_SMA,PRICE_CLOSE);
+   else bands=iBands(_Symbol,PERIOD_M5,InpStrategy!=ORIGINAL ? 20 : InpBollingerPeriod,0,
+                InpStrategy!=ORIGINAL ? 2.5 : InpBollingerDeviation,PRICE_CLOSE);
+   if(InpStrategy==ORIGINAL)
+   {
+      if(InpOscillator==RSI)
+         oscillator_handle=iRSI(_Symbol,PERIOD_M5,InpRSIPeriod,PRICE_CLOSE);
+      else
+         oscillator_handle=iStochastic(_Symbol,PERIOD_M5,InpStochasticK,InpStochasticD,InpStochasticSlowing,MODE_SMA,STO_LOWHIGH);
+   }
+   if(InpStrategy==BB_REENTRY && InpReentryADXMode!=ADX_OFF)
+      adx_handle=iADX(_Symbol,PERIOD_M5,14);
+   if(InpStrategy==BB_REENTRY && InpReentryMACDConfirm)
+      macd_handle=iMACD(_Symbol,PERIOD_M5,InpMACDFast,InpMACDSlow,InpMACDSignal,PRICE_CLOSE);
+   atr_handle=iATR(_Symbol,PERIOD_M5,InpStrategy!=ORIGINAL ? 14 : InpATRPeriod);
+   if((InpStrategy==BB_REENTRY && InpReentryADXMode!=ADX_OFF && adx_handle==INVALID_HANDLE) ||
+      (InpStrategy==BB_REENTRY && InpReentryMACDConfirm && macd_handle==INVALID_HANDLE) ||
+      (InpStrategy==ATR_DEVIATION_REENTRY ? sma_handle==INVALID_HANDLE : bands==INVALID_HANDLE) || atr_handle==INVALID_HANDLE || (InpStrategy==ORIGINAL && oscillator_handle==INVALID_HANDLE)) return INIT_FAILED;
+   reentry_state=NONE;
+   reentry_outer_bar=0;
    g_last_signal_bar=BarOf(TimeCurrent()); // Do not evaluate a historical close on init/reinit.
+   if(InpStrategy==ATR_DEVIATION_REENTRY)
+      Log("INIT",StringFormat("estrategia=ATR_DEVIATION_REENTRY T=%.17g SMA=20 CLOSE ATR=14 M5 SL_ATR=%.10f ATR_max=%.10f entradas=1 TP=SMA20[1]",InpATRDeviationThreshold,InpReentrySLATR,InpATRMax),true);
+   else if(InpStrategy==BB_WICK_REJECTION)
+      Log("INIT",StringFormat("estrategia=BB_WICK_REJECTION modo=CLOSED_BAR wick_min=%.17g SL_ATR=%.10f BB=20/2.5 ATR=14 ATR_max=%.10f TP=SMA20[1] entradas=1",
+          InpWickMinRatio,InpReentrySLATR,InpATRMax),true);
+   else Log("INIT",InpStrategy==BB_REENTRY ?
+       StringFormat("estrategia=BB_REENTRY modo=CLOSED_BAR BB=20/2.5 precio=CLOSE ATR=14 ATR_max=8 entradas=1 SL_ATR=%.10f salida=%s",InpReentrySLATR,InpReentryExitMode==EXIT_ATR_FIXED_2 ? "EXIT_ATR_FIXED_2" : (InpReentryExitMode==EXIT_HALF_SMA20_DYNAMIC ? "EXIT_HALF_SMA20_DYNAMIC" : (InpReentryExitMode==EXIT_OPPOSITE_BAND_DYNAMIC ? "EXIT_OPPOSITE_BAND_DYNAMIC" : (InpReentryExitMode==EXIT_HALF_SMA20_TRAIL_ATR ? "EXIT_HALF_SMA20_TRAIL_ATR" : "EXIT_SMA20_DYNAMIC")))) :
+       "estrategia=ORIGINAL "+(InpOscillator==RSI ?
+       StringFormat("oscilador=RSI periodo=%d compra=%.10f venta=%.10f timeframe=M5 precio=CLOSE",InpRSIPeriod,InpRSIBuyLevel,InpRSISellLevel) :
+       StringFormat("oscilador=STOCHASTIC K=%d D=%d slowing=%d metodo=SMA precio=LOWHIGH compra=10 venta=90",InpStochasticK,InpStochasticD,InpStochasticSlowing)),true);
+   if(InpStrategy!=ORIGINAL)
+      Log("INIT",StringFormat("weekend_guard=%s bloqueo_min=%d cierre_min=%d",InpReentryWeekendGuard ? "true" : "false",
+          InpWeekendEntryBlockMinutes,InpWeekendCloseMinutes),true);
+   if(InpStrategy==BB_REENTRY)
+      Log("INIT",InpReentryMACDConfirm ? StringFormat("MACD_confirm=true fast=%d slow=%d signal=%d M5 PRICE_CLOSE H=MAIN-SIGNAL shifts=1/2",InpMACDFast,InpMACDSlow,InpMACDSignal) : "MACD_confirm=false",true);
+   if(InpStrategy==BB_REENTRY)
+      Log("INIT",StringFormat("ADX_mode=%s ADX_period=14 MACD_confirm=%s",ReentryADXModeName(),InpReentryMACDConfirm ? "true" : "false"),true);
+   if(InpStrategy==BB_REENTRY)
+      Log("INIT",InpReentryBBWFilter ?
+          (InpReentryBBWMode==BBW_BELOW_P70 ? "BBW_filter=true modo=BBW_BELOW_P70 referencia=2..101 n=100 indice=69 BBW1<P70" :
+           "BBW_filter=true modo=BBW_NON_INCREASING BBW1<=BBW2") : "BBW_filter=false modo_efectivo=OFF",true);
+   ResetHalfExit();
+   ResetWeekendGuard();
+   RefreshWeekendGuard();
    CheckOwnership();
    if(manual_required) return INIT_SUCCEEDED;
    if(!history_ok) { state=CLOSING_IDEA; exit_reason="Inicio con propiedad no verificable"; return INIT_SUCCEEDED; }
@@ -1042,7 +1946,7 @@ int OnInit()
    {
       had_exposure=true;
       idea_start=TimeCurrent(); TrackCurrent();
-      BeginClose("Limpieza de residuos propios al iniciar");
+      BeginClose(WeekendGuardEnabled() && g_weekend_close_due ? "WEEKEND_GUARD" : "Limpieza de residuos propios al iniciar");
    }
    else
    {
@@ -1056,13 +1960,22 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    FlushExitReports();
+   if(sma_handle!=INVALID_HANDLE) IndicatorRelease(sma_handle);
+   if(adx_handle!=INVALID_HANDLE) IndicatorRelease(adx_handle);
+   if(macd_handle!=INVALID_HANDLE) IndicatorRelease(macd_handle);
    if(bands!=INVALID_HANDLE) IndicatorRelease(bands);
-   if(stoch!=INVALID_HANDLE) IndicatorRelease(stoch);
+   if(oscillator_handle!=INVALID_HANDLE) IndicatorRelease(oscillator_handle);
    if(atr_handle!=INVALID_HANDLE) IndicatorRelease(atr_handle);
 }
 void OnTick()
 {
-   bool closed_bar_tick=(InpSignalMode==CLOSED_BAR && TakeClosedBarOpportunity());
+   RefreshWeekendGuard();
+   datetime previous_signal_bar=g_last_signal_bar;
+   bool closed_bar_tick=((InpStrategy!=ORIGINAL || InpSignalMode==CLOSED_BAR) && TakeClosedBarOpportunity());
+   bool deviation_gap=(InpStrategy==ATR_DEVIATION_REENTRY && closed_bar_tick && g_last_signal_bar!=previous_signal_bar+PeriodSeconds(PERIOD_M5));
+   if(deviation_gap) ClearReentry("interrupcion entre oportunidades M5; evaluacion omitida");
+   if(InpStrategy==BB_REENTRY && closed_bar_tick && g_last_signal_bar!=previous_signal_bar+PeriodSeconds(PERIOD_M5))
+      ClearReentry("interrupcion entre oportunidades M5");
    g_request_cycle++;
    PruneManagementRetries();
    FlushExitReports();
@@ -1074,15 +1987,24 @@ void OnTick()
       ResetExcursions();
       BeginClose("Exposicion propia tardia fuera de una idea activa");
    }
+   if(HalfExitMode()) { ObserveHalfExtreme(); double closed=0; ReconcileHalfExit(closed); }
    if(state==ACTIVE_IDEA || state==CLOSING_IDEA) InspectIdeaHistory();
    ObserveIdeaExcursions();
+   if((InpStrategy==BB_REENTRY || InpStrategy==ATR_DEVIATION_REENTRY) && (manual_required || !history_ok || state==ACTIVE_IDEA || state==CLOSING_IDEA ||
+      (state==COOLDOWN && TimeCurrent()<cooldown_until))) ClearReentry("idea activa, cierre, enfriamiento o gestion bloqueada");
    if(manual_required) { CloseStep(); return; }
-   if(state==CLOSING_IDEA) { CloseStep(); return; }
+   if(state==CLOSING_IDEA) { CloseStep(); SuperviseWeekendClose(); return; }
    if(!history_ok) return;
    datetime bar=iTime(_Symbol,PERIOD_M5,0);
    if(bar==0)
    {
-      if(closed_bar_tick) Log("REJECTED","modo=CLOSED_BAR serie M5 no disponible; oportunidad descartada",true);
+      if(closed_bar_tick)
+      {
+         Log("REJECTED",InpStrategy==BB_WICK_REJECTION ? "estrategia=BB_WICK_REJECTION serie M5 no disponible; oportunidad descartada" :
+             InpStrategy==BB_REENTRY ? "estrategia=BB_REENTRY serie M5 no disponible; oportunidad descartada" :
+             "modo=CLOSED_BAR serie M5 no disponible; oportunidad descartada",true);
+         ClearReentry("serie M5 no disponible");
+      }
       return;
    }
    if(state==COOLDOWN)
@@ -1105,22 +2027,45 @@ void OnTick()
       if(pnl<=-Budget()) BeginClose("Limite monetario flotante");
       else if(direction>0 ? q.bid<=g_sl : q.ask>=g_sl) BeginClose("SL comun");
       // First attempt the new candle target, so an obsolete target does not win.
-      if(state==ACTIVE_IDEA && tp_bar!=bar)
+      if(state==ACTIVE_IDEA && !(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2) && !(HalfExitMode() && g_half.trailing) && tp_bar!=bar)
       {
          double mid,upper,lower;
-         if(Bands(1,mid,upper,lower))
+         if(TargetInputs(1,mid,upper,lower))
          {
             double previous=target; target=Target(mid,upper,lower); tp_bar=bar;
             if(!SamePrice(previous,target)) Log("TP_UPDATE",StringFormat("anterior=%.5f nuevo=%.5f",previous,target));
          }
          else Problem("Indicadores TP no disponibles; mantener supervision y reintentar");
       }
-      if(state==ACTIVE_IDEA && HitTarget(q)) BeginClose("TP dinamico");
+      if(state==ACTIVE_IDEA && HalfExitMode()) { HalfExitStep(); if(state==CLOSING_IDEA) CloseStep(); return; }
+      if(state==ACTIVE_IDEA && HitTarget(q)) BeginClose(InpStrategy==BB_REENTRY && InpReentryExitMode==EXIT_ATR_FIXED_2 ? "TP fijo" : "TP dinamico");
       if(state==ACTIVE_IDEA) SyncTP();
       if(state==CLOSING_IDEA) CloseStep();
       return;
    }
-   if(ArraySize(pending)>0 || OwnPositions()>0 || OwnOrders()>0 || ForeignExposure()) return;
+   if(ArraySize(pending)>0 || OwnPositions()>0 || OwnOrders()>0 || ForeignExposure())
+   {
+      ClearReentry("exposicion o solicitud pendiente");
+      return;
+   }
+   if(InpStrategy==ATR_DEVIATION_REENTRY)
+   {
+      if(WeekendGuardEnabled() && g_weekend_blocked) return;
+      if(closed_bar_tick && !deviation_gap) EvaluateATRDeviationSignal();
+      return;
+   }
+   if(InpStrategy==BB_WICK_REJECTION)
+   {
+      if(WeekendGuardEnabled() && g_weekend_blocked) return;
+      if(closed_bar_tick) EvaluateWickSignal();
+      return;
+   }
+   if(InpStrategy==BB_REENTRY)
+   {
+      if(WeekendGuardEnabled() && g_weekend_blocked) return;
+      if(closed_bar_tick) EvaluateReentrySignal();
+      return;
+   }
    if(InpSignalMode==CLOSED_BAR)
    {
       if(closed_bar_tick) EvaluateClosedBarSignal();
@@ -1128,7 +2073,7 @@ void OnTick()
    }
    double mid,upper,lower,k,atr_value;
    MqlRates current[1];
-   if(!Bands(0,mid,upper,lower) || !Value(stoch,0,0,k) || !Value(atr_handle,0,1,atr_value) || CopyRates(_Symbol,PERIOD_M5,0,1,current)!=1)
+   if(!Bands(0,mid,upper,lower) || !Value(oscillator_handle,0,0,k) || !Value(atr_handle,0,1,atr_value) || CopyRates(_Symbol,PERIOD_M5,0,1,current)!=1)
    { Problem("REJECTED: indicadores no disponibles; senal no consumida"); return; }
    int side=SignalSide(current[0].low,current[0].high,lower,upper,k,bar);
    if(side>0) processed_buy=bar;
@@ -1143,6 +2088,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
 {
    if(trans.type==TRADE_TRANSACTION_REQUEST)
    {
+      HalfExitTransaction(request,result);
       for(int i=ArraySize(pending)-1;i>=0;i--)
       {
          if(pending[i].id==0 || result.request_id!=pending[i].id) continue;
@@ -1168,6 +2114,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
          Quarantine("Transaccion ajena sobre posicion netting de la idea");
    }
    ReconcilePending();
+   if(HalfExitMode()) { ObserveHalfExtreme(); double closed=0; ReconcileHalfExit(closed); }
    if(state==ACTIVE_IDEA || state==CLOSING_IDEA) InspectIdeaHistory();
    ObserveIdeaExcursions();
    FlushExitReports();

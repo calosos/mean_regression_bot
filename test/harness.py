@@ -40,7 +40,7 @@ def balanced_end(mask, opening):
 
 def function(text, name):
     mask = code_mask(text)
-    match = re.search(rf"(?m)^(?:bool|double|int|datetime|void|string)\s+{re.escape(name)}\s*\(", mask)
+    match = re.search(rf"(?m)^(?:bool|double|int|ulong|datetime|void|string)\s+{re.escape(name)}\s*\(", mask)
     if not match:
         raise ValueError(f"EA function not found: {name}")
     opening = mask.index("{", match.start())
@@ -68,7 +68,7 @@ def declaration(text, name):
 
 def cpp_arrays(text):
     """Adapt MQL dynamic-array declarations to std::vector without altering logic."""
-    pattern = r"\b(ulong|long|double|ExitReport|ManagementRetry|DiagnosticPosition)\s+(\w+\[\](?:\s*,\s*\w+\[\])*)"
+    pattern = r"\b(ulong|long|double|ExitReport|ManagementRetry|DiagnosticPosition|WeeklySession)\s+(\w+\[\](?:\s*,\s*\w+\[\])*)"
     return re.sub(pattern, lambda match: f"std::vector<{match[1]}> {match[2].replace('[]', '')}", text)
 
 

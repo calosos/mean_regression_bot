@@ -22,3 +22,7 @@ const char *arg(const string &value){return value.c_str();}
 template<class T> T arg(T value){return value;}
 template<class... T> string StringFormat(const char *raw,T... values){string fmt=raw;size_t n;while((n=fmt.find("%I64d"))!=string::npos)fmt.replace(n,5,"%ld");int size=std::snprintf(nullptr,0,fmt.c_str(),arg(values)...);assert(size>=0);std::vector<char> out(size+1);std::snprintf(out.data(),out.size(),fmt.c_str(),arg(values)...);return out.data();}
 void Log(const string &tag,const string &message){if(detailed)logs.push_back(tag+" "+message);}
+
+enum Oscillator { STOCHASTIC, RSI };
+Oscillator InpOscillator=STOCHASTIC;
+double InpRSIBuyLevel=30,InpRSISellLevel=70;
